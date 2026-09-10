@@ -209,7 +209,7 @@ ModelRunner::ModelRunner()
     , raw_arena(nullptr)
     , tensor_arena(nullptr) {}
 
-extern "C" char g_last_tflm_error[256];
+extern "C" char g_last_tflm_error[256] = "";
 
 bool ModelRunner::begin() {
     g_last_tflm_error[0] = '\0';
@@ -296,7 +296,7 @@ bool ModelRunner::begin() {
     Serial.printf("[Model] Outputs size: %d\n", static_interpreter.outputs_size());
     for (int i = 0; i < static_interpreter.outputs_size(); ++i) {
         TfLiteTensor* out = static_interpreter.output(i);
-        Serial.printf("[Model] Output %d: Name=%s, Type=%d, DimsSize=%d, Dims=[", i, out->name ? out->name : "none", out->type, out->dims->size);
+        Serial.printf("[Model] Output %d: Type=%d, DimsSize=%d, Dims=[", i, out->type, out->dims->size);
         for (int d = 0; d < out->dims->size; ++d) {
             Serial.printf("%d%s", out->dims->data[d], (d == out->dims->size - 1) ? "" : ", ");
         }
@@ -399,8 +399,6 @@ float ModelRunner::runInference(const float* featureVector, int8_t* out_embeddin
 }
 
 
-
-extern "C" char g_last_tflm_error[256] = "";
 
 const char* ModelRunner::getLastError() const {
     return g_last_tflm_error;
