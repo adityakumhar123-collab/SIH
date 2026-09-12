@@ -1,32 +1,33 @@
 #include "BLEManager.h"
-#include "Config.h"
-#include "ModelRunner.h"
+#include "EdgeAnalytics.h"
 #include <esp_system.h>
 
 // Connection callbacks
 class BLEServerCallbacksImpl : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override {
-        Serial.println("[BLE_CB] onConnect (simple) callback triggered.");
+        Serial.println("[BLE_CB] onConnect triggered. Mode -> BLE ON.");
         BLEManager::getInstance().setConnected(true);
+        BLEManager::getInstance().setStreamingEnabled(true);
     }
 
     void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) override {
-        Serial.println("[BLE_CB] onConnect (param) callback triggered.");
+        Serial.println("[BLE_CB] onConnect (param) triggered. Mode -> BLE ON.");
         BLEManager::getInstance().setConnected(true);
+        BLEManager::getInstance().setStreamingEnabled(true);
     }
 
     void onDisconnect(BLEServer* pServer) override {
-        Serial.println("[BLE_CB] onDisconnect (simple) callback triggered.");
+        Serial.println("[BLE_CB] onDisconnect triggered. Mode -> BLE OFF (Local Health Sensing).");
         BLEManager::getInstance().setConnected(false);
     }
 
     void onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) override {
-        Serial.println("[BLE_CB] onDisconnect (param) callback triggered.");
+        Serial.println("[BLE_CB] onDisconnect (param) triggered. Mode -> BLE OFF (Local Health Sensing).");
         BLEManager::getInstance().setConnected(false);
     }
 };
 
-// Command character callbacks
+// Command characteristic callbacks
 class BLECharacteristicCallbacksImpl : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pCharacteristic) override {
         std::string value = pCharacteristic->getValue();
@@ -41,7 +42,7 @@ BLEManager& BLEManager::getInstance() {
     return instance;
 }
 
-BLEManager::BLEManager() 
+BLEManager::BLEManager()
     : pServer(nullptr)
     , pCharCommand(nullptr)
     , pCharDeviceInfo(nullptr)
@@ -53,105 +54,79 @@ BLEManager::BLEManager()
     , isStreaming(false)
     , eventAck(false)
     , calibrationRequest(false)
-    , pendingCommand(0)
-    , sensorSequenceId(0)
-    , featureSequenceId(0) {}
+    , pendingCommand(0) {}
 
 void BLEManager::begin() {
     Serial.println("[BLE] Initializing BLE stack.");
-    
-    // Change base MAC address to bypass Android BLE GATT cache corruption.
-    // Incremented to 0x40 (BLE addr ends in 0x41) to force a full cache rebuild
-    // after FEATURE characteristic was not found at 0x30.
+
     uint8_t customMac[6] = {0x90, 0x70, 0x69, 0x11, 0x69, 0x55};
     esp_err_t macErr = esp_base_mac_addr_set(customMac);
     if (macErr != ESP_OK) {
         Serial.printf("[BLE] Warning: Failed to set base MAC address: 0x%x\n", macErr);
-    } else {
-        Serial.println("[BLE] Base MAC address successfully set.");
     }
-    
-    // Set MTU before init to avoid packet fragmentation.
-    // Default ATT payload is 20 bytes; Sensor packets are 22 bytes, which
-    // causes BLE fragmentation and corrupts the XOR checksum on the app side.
-    BLEDevice::setMTU(64);
 
-    // Initialize BLE Device
+    BLEDevice::setMTU(64);
     BLEDevice::init(BLE_DEVICE_NAME);
-    
-    // Increase TX power to maximum (+9dBm) for better range and connection stability
     BLEDevice::setPower(ESP_PWR_LVL_P9);
 
-    // Create BLE Server
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new BLEServerCallbacksImpl());
 
-    // Create primary SafeBand Service
     BLEService* pService = pServer->createService(BLEUUID(SERVICE_UUID), 30);
 
-    // Create Command Input Characteristic (Write)
+    // Command Characteristic (Write)
     pCharCommand = pService->createCharacteristic(
         CHAR_UUID_COMMAND,
         BLECharacteristic::PROPERTY_WRITE
     );
     pCharCommand->setCallbacks(new BLECharacteristicCallbacksImpl());
 
-    // Create Device Info Characteristic (Read)
+    // Device Info Characteristic (Read)
     pCharDeviceInfo = pService->createCharacteristic(
         CHAR_UUID_DEVICE_INFO,
         BLECharacteristic::PROPERTY_READ
     );
-    pCharDeviceInfo->setValue("SafeBand-ESP32 v1.0.0");
+    pCharDeviceInfo->setValue(FIRMWARE_VERSION_STR);
 
-    // Create Status Notification Characteristic (Notify)
+    // Status Characteristic (Notify - 0x02 Status)
     pCharStatus = pService->createCharacteristic(
         CHAR_UUID_STATUS,
         BLECharacteristic::PROPERTY_NOTIFY
     );
     pCharStatus->addDescriptor(new BLE2902());
 
-    // Create Sensor Notification Characteristic (Notify)
+    // Sensor Characteristic (Notify - 0x01 Motion)
     pCharSensor = pService->createCharacteristic(
         CHAR_UUID_SENSOR,
         BLECharacteristic::PROPERTY_NOTIFY
     );
     pCharSensor->addDescriptor(new BLE2902());
 
-    // Create Feature Notification Characteristic (Notify)
+    // Feature Characteristic (Notify - 0x03 Env & 0x04 Vitals)
     pCharFeature = pService->createCharacteristic(
         CHAR_UUID_FEATURE,
         BLECharacteristic::PROPERTY_NOTIFY
     );
     pCharFeature->addDescriptor(new BLE2902());
 
-    // Start Service
     pService->start();
 
-
-    // Start Advertising
+    // Advertising setup
     BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
-    
-    // Explicitly configure advertising packet payload.
-    // The main advertisement packet fits the flags and the service UUID (21 bytes).
-    // The device name is placed in the Scan Response packet to avoid overflowing the 31-byte BLE limit,
-    // preventing heap corruption/crashes in the BLE GAP controller.
     BLEAdvertisementData oAdvertisementData;
-    oAdvertisementData.setFlags(0x06); // General discoverable, BR/EDR not supported
+    oAdvertisementData.setFlags(0x06);
     oAdvertisementData.setCompleteServices(BLEUUID(SERVICE_UUID));
     pAdvertising->setAdvertisementData(oAdvertisementData);
-    
-    // Scan response data contains the device name
+
     BLEAdvertisementData oScanResponseData;
     oScanResponseData.setName(BLE_DEVICE_NAME);
     pAdvertising->setScanResponseData(oScanResponseData);
     pAdvertising->setScanResponse(true);
-    
-    // Set connection intervals helpful for iOS/Android stability
+
     pAdvertising->setMinPreferred(0x06);
     pAdvertising->setMinPreferred(0x12);
-    
+
     BLEDevice::startAdvertising();
-    
     Serial.println("[BLE] Service started. Advertising active.");
 }
 
@@ -161,122 +136,146 @@ void BLEManager::setDeviceInfo(const char* info) {
     }
 }
 
-void BLEManager::sendStatusPacket(uint8_t batteryPct, uint8_t wearConfidence, uint8_t systemFlags, uint16_t uptimeMinutes, uint8_t avgAnomaly, uint8_t inferenceRate) {
-    if (!deviceConnected) return;
+// 0x01: Motion Packet (100 Hz)
+// Format: [0x01 (1B) | timestamp ms (4B) | ax (2B) | ay (2B) | az (2B) | gx (2B) | gy (2B) | gz (2B) | checksum (1B)] -> 18 Bytes
+void BLEManager::sendMotionPacket(uint32_t timestampMs, const IMUData& imu) {
+    if (!deviceConnected || !isStreaming || pCharSensor == nullptr) return;
+
+    uint8_t packet[18];
+    packet[0] = PACKET_TYPE_MOTION; // 0x01
+
+    // Timestamp (little endian)
+    packet[1] = (uint8_t)(timestampMs & 0xFF);
+    packet[2] = (uint8_t)((timestampMs >> 8) & 0xFF);
+    packet[3] = (uint8_t)((timestampMs >> 16) & 0xFF);
+    packet[4] = (uint8_t)((timestampMs >> 24) & 0xFF);
+
+    // Accel in milli-g (1g = 1000 mg)
+    int16_t axMg = (int16_t)(imu.ax * 1000.0f);
+    int16_t ayMg = (int16_t)(imu.ay * 1000.0f);
+    int16_t azMg = (int16_t)(imu.az * 1000.0f);
+
+    packet[5] = (uint8_t)(axMg & 0xFF);
+    packet[6] = (uint8_t)((axMg >> 8) & 0xFF);
+    packet[7] = (uint8_t)(ayMg & 0xFF);
+    packet[8] = (uint8_t)((ayMg >> 8) & 0xFF);
+    packet[9] = (uint8_t)(azMg & 0xFF);
+    packet[10] = (uint8_t)((azMg >> 8) & 0xFF);
+
+    // Gyro in 0.1 dps
+    int16_t gxUnits = (int16_t)(imu.gx * 10.0f);
+    int16_t gyUnits = (int16_t)(imu.gy * 10.0f);
+    int16_t gzUnits = (int16_t)(imu.gz * 10.0f);
+
+    packet[11] = (uint8_t)(gxUnits & 0xFF);
+    packet[12] = (uint8_t)((gxUnits >> 8) & 0xFF);
+    packet[13] = (uint8_t)(gyUnits & 0xFF);
+    packet[14] = (uint8_t)((gyUnits >> 8) & 0xFF);
+    packet[15] = (uint8_t)(gzUnits & 0xFF);
+    packet[16] = (uint8_t)((gzUnits >> 8) & 0xFF);
+
+    packet[17] = calculateChecksum(packet, 17);
+
+    pCharSensor->setValue(packet, 18);
+    pCharSensor->notify();
+}
+
+// 0x02: Device Status Packet (transmitted on 1% battery drop or periodic 5min)
+// Format: [0x02 (1B) | Battery% (1B) | FwMajor (1B) | FwMinor (1B) | UptimeSec (4B) | isBleConnected (1B) | checksum (1B)] -> 10 Bytes
+void BLEManager::sendStatusPacket(uint8_t batteryPct, uint8_t fwMajor, uint8_t fwMinor, uint32_t uptimeSec, uint8_t isBleConnected) {
+    if (!deviceConnected || pCharStatus == nullptr) return;
 
     uint8_t packet[10];
-    packet[0] = 0x02; // Packet Type
+    packet[0] = PACKET_TYPE_STATUS; // 0x02
     packet[1] = batteryPct;
-    packet[2] = wearConfidence;
-    packet[3] = 0x01; // Model Version (Firmware ML model version)
-    packet[4] = systemFlags;
-    
-    // Little-endian uptimeMinutes
-    packet[5] = static_cast<uint8_t>(uptimeMinutes & 0xFF);
-    packet[6] = static_cast<uint8_t>((uptimeMinutes >> 8) & 0xFF);
-    
-    packet[7] = avgAnomaly;
-    packet[8] = inferenceRate;
-    
-    // Checksum
+    packet[2] = fwMajor;
+    packet[3] = fwMinor;
+
+    packet[4] = (uint8_t)(uptimeSec & 0xFF);
+    packet[5] = (uint8_t)((uptimeSec >> 8) & 0xFF);
+    packet[6] = (uint8_t)((uptimeSec >> 16) & 0xFF);
+    packet[7] = (uint8_t)((uptimeSec >> 24) & 0xFF);
+
+    packet[8] = isBleConnected;
     packet[9] = calculateChecksum(packet, 9);
 
     pCharStatus->setValue(packet, 10);
     pCharStatus->notify();
 }
 
+// 0x03: Environment Packet (1 Hz)
+// Format: [0x03 (1B) | Timestamp ms (4B) | Temp (4B float) | Pressure (4B float) | Humidity (4B float) | checksum (1B)] -> 18 Bytes
+void BLEManager::sendEnvironmentPacket(uint32_t timestampMs, float tempC, float pressureHpa, float humidityPct) {
+    if (!deviceConnected || pCharFeature == nullptr) return;
 
-void BLEManager::sendSensorPacket(uint16_t msSinceBoot, const IMUData& imu, float resultantAccel, float jerk, uint8_t anomalyScore) {
-    if (!deviceConnected || !isStreaming) return;
+    uint8_t packet[18];
+    packet[0] = PACKET_TYPE_ENVIRONMENT; // 0x03
 
-    uint8_t packet[22];
-    packet[0] = 0x03; // Packet Type
-    packet[1] = sensorSequenceId++;
-    
-    // Little-endian msSinceBoot
-    packet[2] = static_cast<uint8_t>(msSinceBoot & 0xFF);
-    packet[3] = static_cast<uint8_t>((msSinceBoot >> 8) & 0xFF);
-    
-    // Convert float m/s^2 to milli-Gs (int16_t, where 1g = 9.80665 m/s^2 = 1000 mg)
-    int16_t axMg = static_cast<int16_t>(imu.ax * 101.97162f);
-    int16_t ayMg = static_cast<int16_t>(imu.ay * 101.97162f);
-    int16_t azMg = static_cast<int16_t>(imu.az * 101.97162f);
-    
-    // Convert float dps to 0.1 dps units (int16_t)
-    int16_t gxUnits = static_cast<int16_t>(imu.gx * 10.0f);
-    int16_t gyUnits = static_cast<int16_t>(imu.gy * 10.0f);
-    int16_t gzUnits = static_cast<int16_t>(imu.gz * 10.0f);
-    
-    uint16_t resMg = static_cast<uint16_t>(resultantAccel * 101.97162f);
-    int16_t jerkMgS = static_cast<int16_t>(jerk * 101.97162f);
+    packet[1] = (uint8_t)(timestampMs & 0xFF);
+    packet[2] = (uint8_t)((timestampMs >> 8) & 0xFF);
+    packet[3] = (uint8_t)((timestampMs >> 16) & 0xFF);
+    packet[4] = (uint8_t)((timestampMs >> 24) & 0xFF);
 
-    // Accel X, Y, Z
-    packet[4] = static_cast<uint8_t>(axMg & 0xFF);
-    packet[5] = static_cast<uint8_t>((axMg >> 8) & 0xFF);
-    packet[6] = static_cast<uint8_t>(ayMg & 0xFF);
-    packet[7] = static_cast<uint8_t>((ayMg >> 8) & 0xFF);
-    packet[8] = static_cast<uint8_t>(azMg & 0xFF);
-    packet[9] = static_cast<uint8_t>((azMg >> 8) & 0xFF);
-    
-    // Gyro X, Y, Z
-    packet[10] = static_cast<uint8_t>(gxUnits & 0xFF);
-    packet[11] = static_cast<uint8_t>((gxUnits >> 8) & 0xFF);
-    packet[12] = static_cast<uint8_t>(gyUnits & 0xFF);
-    packet[13] = static_cast<uint8_t>((gyUnits >> 8) & 0xFF);
-    packet[14] = static_cast<uint8_t>(gzUnits & 0xFF);
-    packet[15] = static_cast<uint8_t>((gzUnits >> 8) & 0xFF);
-    
-    // Resultant Accel
-    packet[16] = static_cast<uint8_t>(resMg & 0xFF);
-    packet[17] = static_cast<uint8_t>((resMg >> 8) & 0xFF);
-    
-    // Jerk
-    packet[18] = static_cast<uint8_t>(jerkMgS & 0xFF);
-    packet[19] = static_cast<uint8_t>((jerkMgS >> 8) & 0xFF);
-    
-    packet[20] = anomalyScore;
-    packet[21] = calculateChecksum(packet, 21);
+    memcpy(&packet[5], &tempC, 4);
+    memcpy(&packet[9], &pressureHpa, 4);
+    memcpy(&packet[13], &humidityPct, 4);
 
-    pCharSensor->setValue(packet, 22);
-    pCharSensor->notify();
+    packet[17] = calculateChecksum(packet, 17);
+
+    pCharFeature->setValue(packet, 18);
+    pCharFeature->notify();
+}
+
+// 0x04: Vital Packet (100 Hz)
+// Format: [0x04 (1B) | Timestamp ms (4B) | RedChannel (4B) | IRChannel (4B) | SignalQuality (1B) | checksum (1B)] -> 15 Bytes
+void BLEManager::sendVitalPacket(uint32_t timestampMs, uint32_t red, uint32_t ir, uint8_t signalQuality) {
+    if (!deviceConnected || !isStreaming || pCharFeature == nullptr) return;
+
+    uint8_t packet[15];
+    packet[0] = PACKET_TYPE_VITAL; // 0x04
+
+    packet[1] = (uint8_t)(timestampMs & 0xFF);
+    packet[2] = (uint8_t)((timestampMs >> 8) & 0xFF);
+    packet[3] = (uint8_t)((timestampMs >> 16) & 0xFF);
+    packet[4] = (uint8_t)((timestampMs >> 24) & 0xFF);
+
+    memcpy(&packet[5], &red, 4);
+    memcpy(&packet[9], &ir, 4);
+
+    packet[13] = signalQuality;
+    packet[14] = calculateChecksum(packet, 14);
+
+    pCharFeature->setValue(packet, 15);
+    pCharFeature->notify();
 }
 
 void BLEManager::sendFeaturePacket(uint8_t seq, uint8_t anomalyScore, uint8_t motionState, uint8_t dominantFreqHz, uint8_t zcr, uint8_t spectralEntropy, uint16_t eigenvalueRatioScaled, uint8_t wearConfidence, uint16_t peakResultantAccelMg, uint16_t durationUnits, const int8_t* motionEmbedding, uint8_t isThreat, const float* twelveFeatures) {
-    if (!deviceConnected) return;
+    if (!deviceConnected || pCharFeature == nullptr) return;
 
     uint8_t packet[46];
-    packet[0] = 0x04; // Packet Type
-    packet[1] = featureSequenceId++;
+    packet[0] = 0x04;
+    packet[1] = seq;
     packet[2] = anomalyScore;
     packet[3] = motionState;
     packet[4] = dominantFreqHz;
     packet[5] = zcr;
     packet[6] = spectralEntropy;
-    
-    // Little-endian eigenvalue ratio
     packet[7] = static_cast<uint8_t>(eigenvalueRatioScaled & 0xFF);
     packet[8] = static_cast<uint8_t>((eigenvalueRatioScaled >> 8) & 0xFF);
-    
     packet[9] = wearConfidence;
-    
-    // Little-endian peak accel
     packet[10] = static_cast<uint8_t>(peakResultantAccelMg & 0xFF);
     packet[11] = static_cast<uint8_t>((peakResultantAccelMg >> 8) & 0xFF);
-    
-    // Little-endian duration
     packet[12] = static_cast<uint8_t>(durationUnits & 0xFF);
     packet[13] = static_cast<uint8_t>((durationUnits >> 8) & 0xFF);
-    
-    // Copy the 16-byte motion embedding
+
     if (motionEmbedding != nullptr) {
         memcpy(&packet[14], motionEmbedding, 16);
     } else {
         memset(&packet[14], 0, 16);
     }
-    
+
     packet[30] = isThreat;
-    
-    // Convert the 7 missing features to 2-byte scaled integers
+
     uint16_t u_std  = (twelveFeatures != nullptr) ? static_cast<uint16_t>(twelveFeatures[0] * 1000.0f) : 0;
     int16_t s_skew  = (twelveFeatures != nullptr) ? static_cast<int16_t>(twelveFeatures[2] * 1000.0f) : 0;
     int16_t s_kurt  = (twelveFeatures != nullptr) ? static_cast<int16_t>(twelveFeatures[3] * 100.0f) : 0;
@@ -287,43 +286,34 @@ void BLEManager::sendFeaturePacket(uint8_t seq, uint8_t anomalyScore, uint8_t mo
 
     packet[31] = static_cast<uint8_t>(u_std & 0xFF);
     packet[32] = static_cast<uint8_t>((u_std >> 8) & 0xFF);
-
     packet[33] = static_cast<uint8_t>(s_skew & 0xFF);
     packet[34] = static_cast<uint8_t>((s_skew >> 8) & 0xFF);
-
     packet[35] = static_cast<uint8_t>(s_kurt & 0xFF);
     packet[36] = static_cast<uint8_t>((s_kurt >> 8) & 0xFF);
-
     packet[37] = static_cast<uint8_t>(u_peak & 0xFF);
     packet[38] = static_cast<uint8_t>((u_peak >> 8) & 0xFF);
-
     packet[39] = static_cast<uint8_t>(u_band & 0xFF);
     packet[40] = static_cast<uint8_t>((u_band >> 8) & 0xFF);
-
     packet[41] = static_cast<uint8_t>(u_var & 0xFF);
     packet[42] = static_cast<uint8_t>((u_var >> 8) & 0xFF);
-
     packet[43] = static_cast<uint8_t>(u_coup & 0xFF);
     packet[44] = static_cast<uint8_t>((u_coup >> 8) & 0xFF);
 
-    // Checksum
     packet[45] = calculateChecksum(packet, 45);
 
     pCharFeature->setValue(packet, 46);
     pCharFeature->notify();
 }
 
-
 void BLEManager::handleConnectionStatus() {
-    // If connection status has changed
     if (deviceConnected && !oldDeviceConnected) {
         oldDeviceConnected = deviceConnected;
-        Serial.println("[BLE] Client connected.");
+        Serial.println("[BLE] Phone connected. Switched to BLE ON mode.");
     }
     if (!deviceConnected && oldDeviceConnected) {
         oldDeviceConnected = deviceConnected;
         isStreaming = false;
-        Serial.println("[BLE] Client disconnected. Restarting advertising.");
+        Serial.println("[BLE] Phone disconnected. Switched to BLE OFF mode (Autonomous Local Sensing). Restarting advertising.");
         BLEDevice::startAdvertising();
     }
 }
@@ -340,32 +330,32 @@ void BLEManager::processCommand(uint8_t command) {
     Serial.printf("[BLE] Processing command: 0x%02X\n", command);
 
     switch (command) {
-        case 0x01: // Start sensor streaming
+        case 0x01: // Start streaming
             isStreaming = true;
             Serial.println("[BLE] Command: Start streaming.");
             break;
-        case 0x02: // Stop sensor streaming
+        case 0x02: // Stop streaming
             isStreaming = false;
             Serial.println("[BLE] Command: Stop streaming.");
             break;
         case 0x03: // Request immediate Status Packet
-            Serial.println("[BLE] Command: Status packet requested.");
+            Serial.println("[BLE] Command: Immediate status requested.");
             break;
         case 0x04: // Acknowledge event
             eventAck = true;
             Serial.println("[BLE] Command: Event acknowledged.");
             break;
-        case 0x05: // Enter calibration mode
+        case 0x05: // Calibration request
             calibrationRequest = true;
             Serial.println("[BLE] Command: Calibration requested.");
             break;
-
-        case 0xFF: // Emergency cancel (user confirmed safe)
+        case 0xFF: // Emergency cancel (e.g. cancel fall countdown)
             eventAck = true;
-            Serial.println("[BLE] Command: Emergency cancel.");
+            EdgeAnalytics::getInstance().cancelFallAlarm();
+            Serial.println("[BLE] Command: Fall/Emergency alert cancelled by phone.");
             break;
         default:
-            Serial.printf("[BLE] Error: Unknown command 0x%02X\n", command);
+            Serial.printf("[BLE] Unknown command: 0x%02X\n", command);
             break;
     }
 }

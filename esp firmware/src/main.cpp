@@ -1,424 +1,288 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include "Config.h"
 #include "IMUSensor.h"
-#include "FeatureExtractor.h"
-#include "ModelRunner.h"
+#include "VitalSensor.h"
+#include "EnvironmentSensor.h"
+#include "BuzzerManager.h"
+#include "EdgeAnalytics.h"
 #include "BLEManager.h"
 #include "PowerManager.h"
 
-// FreeRTOS Task Handles and Queues
+// FreeRTOS Task Handles
 TaskHandle_t samplerTaskHandle = nullptr;
-TaskHandle_t processingTaskHandle = nullptr;
-TaskHandle_t heartbeatTaskHandle = nullptr;
-QueueHandle_t sampleQueue = nullptr;
+TaskHandle_t environmentTaskHandle = nullptr;
+TaskHandle_t buzzerTaskHandle = nullptr;
 
-// Shared state for system health
+// System tracking
 uint8_t systemFlags = 0;
-float runningAnomalySum = 0.0f;
-uint32_t runningAnomalyCount = 0;
-float currentAnomalyScore = 0.0f;
+uint8_t lastReportedBatteryPct = 100;
+uint32_t lastStatusPacketTimeMs = 0;
 
-// Wear confidence tracking
-volatile uint8_t g_wearConfidence = 0;
-volatile uint32_t g_stillWindowCount = 0;
+// Shared latest readings for periodic serial diagnostics
+IMUData g_latestImu = {0};
+VitalData g_latestVital = {0};
+EnvironmentData g_latestEnv = {0};
 
-// Calibration variables
-bool isCalibrating = false;
-uint32_t calibrationSamplesCollected = 0;
-float calibAccelSum[3] = {0.0f};
+// Task prototypes
+void SamplerTask(void* pvParameters);
+void EnvironmentTask(void* pvParameters);
+void BuzzerTask(void* pvParameters);
 
-// Task function declarations
-void IMUSamplerTask(void* pvParameters);
-void ProcessingTask(void* pvParameters);
-void HeartbeatTask(void* pvParameters);
+// I2C Bus Scanner
+void scanI2CBus() {
+    Serial.println("\n---------------- I2C Bus Scan ----------------");
+    Serial.printf("Scanning I2C on SDA=GPIO%d, SCL=GPIO%d...\n", I2C_SDA_PIN, I2C_SCL_PIN);
+    uint8_t count = 0;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        uint8_t error = Wire.endTransmission();
+        if (error == 0) {
+            Serial.printf(" -> Found I2C Device at 0x%02X ", addr);
+            if (addr == 0x68 || addr == 0x69) Serial.print("(MPU-6050 / IMU)");
+            else if (addr == 0x57) Serial.print("(MAX30102 PPG Vital)");
+            else if (addr == 0x76 || addr == 0x77) Serial.print("(BMP280 / BME280 Environment)");
+            Serial.println();
+            count++;
+        }
+    }
+    if (count == 0) {
+        Serial.println(" -> No I2C devices found! Check SDA/SCL/VCC/GND connections.");
+    } else {
+        Serial.printf(" -> Scan complete: %d device(s) found.\n", count);
+    }
+    Serial.println("----------------------------------------------\n");
+}
 
 void setup() {
     Serial.begin(115200);
-    // Wait up to 4 seconds for Serial connection on USB boards
     unsigned long start_time = millis();
-    while (!Serial && (millis() - start_time < 4000)) {
+    while (!Serial && (millis() - start_time < 3000)) {
         delay(10);
     }
-    Serial.println("\n===========================================");
-    Serial.println("         SafeBand Firmware Starting        ");
-    Serial.println("===========================================");
 
-    // 1. Initialize Power/Battery Manager
+    Serial.println("\n=======================================================");
+    Serial.println("     SafeBand Dual-Mode ESP32 Health Firmware          ");
+    Serial.println("=======================================================");
+
+    // 1. Initialize Power Manager
     PowerManager::getInstance().begin();
-    systemFlags |= (1 << 2); // Set Flash/power subsystem OK
+    systemFlags |= (1 << 2);
 
-    // 2. Initialize IMU Sensor
+    // 2. Initialize Buzzer Subsystem
+    BuzzerManager::getInstance().begin();
+
+    // 3. Initialize I2C and Scan
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
+    Wire.setTimeOut(100);
+    scanI2CBus();
+
+    // 4. Initialize Sensors
     if (IMUSensor::getInstance().begin()) {
-        systemFlags |= (1 << 0); // Set IMU OK
+        systemFlags |= (1 << 0);
+        Serial.println("[Setup] MPU6050 IMU initialized.");
     } else {
-        Serial.println("[Setup] Warning: IMU initialization failed!");
+        Serial.println("[Setup] Warning: MPU6050 initialization failed! (Retrying in background)");
     }
 
-    // 3. Initialize Model Runner (autoencoder placeholder)
-    if (ModelRunner::getInstance().begin()) {
-        systemFlags |= (1 << 3); // Set Inference running
+    if (VitalSensor::getInstance().begin()) {
+        systemFlags |= (1 << 4);
+        Serial.println("[Setup] MAX30102 PPG Vital sensor initialized.");
+    } else {
+        Serial.println("[Setup] Warning: MAX30102 initialization failed! (Retrying in background)");
     }
 
-    // 4. Initialize BLE Stack
+    if (EnvironmentSensor::getInstance().begin()) {
+        systemFlags |= (1 << 5);
+        Serial.println("[Setup] BMP280/BME280 Environment sensor initialized.");
+    } else {
+        Serial.println("[Setup] Warning: BMP280 initialization failed! Using simulated defaults.");
+    }
+
+    // 5. Initialize Edge Analytics Engine
+    EdgeAnalytics::getInstance().begin();
+
+    // 6. Initialize BLE Stack
     BLEManager::getInstance().begin();
-    if (!(systemFlags & (1 << 3))) {
-        BLEManager::getInstance().setDeviceInfo(ModelRunner::getInstance().getLastError());
-    }
-    systemFlags |= (1 << 1); // Set BLE OK
+    systemFlags |= (1 << 1);
 
-    // 5. Create FreeRTOS Queue (capacity: 100 samples)
-    sampleQueue = xQueueCreate(100, sizeof(IMUData));
-    if (sampleQueue == nullptr) {
-        Serial.println("[Setup] Error: Failed to create sample queue.");
-        while (1) { delay(1000); }
-    }
+    lastReportedBatteryPct = PowerManager::getInstance().readBatteryPercentage();
 
-    // 6. Spawn FreeRTOS Tasks
-    Serial.printf("[Setup] Pre-task spawn free heap: %d bytes, Max block: %d bytes\n", 
-                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    // 7. Spawn FreeRTOS Tasks
+    Serial.printf("[Setup] Free Heap: %d bytes\n", ESP.getFreeHeap());
 
-    // Sampler task: High priority (10), runs on Core 1 (default Arduino core)
-    BaseType_t r1 = xTaskCreatePinnedToCore(
-        IMUSamplerTask,
+    // Task 1: 100 Hz Sampler Task on Core 1 (High priority)
+    xTaskCreatePinnedToCore(
+        SamplerTask,
         "SamplerTask",
-        3072,
+        4096,
         nullptr,
         10,
         &samplerTaskHandle,
         1
     );
-    Serial.printf("[Setup] SamplerTask spawn result: %s\n", (r1 == pdPASS) ? "SUCCESS" : "FAILED");
 
-    // Processing task: Medium priority (5), runs on Core 1 (handles heavy float/FFT maths)
-    BaseType_t r2 = xTaskCreatePinnedToCore(
-        ProcessingTask,
-        "ProcessingTask",
+    // Task 2: 1 Hz Environment & Diagnostics Task on Core 0
+    xTaskCreatePinnedToCore(
+        EnvironmentTask,
+        "EnvTask",
         4096,
         nullptr,
-        5,
-        &processingTaskHandle,
-        1
-    );
-    Serial.printf("[Setup] ProcessingTask spawn result: %s\n", (r2 == pdPASS) ? "SUCCESS" : "FAILED");
-
-    // Heartbeat task: Low priority (2), runs on Core 0 (handles BLE state and slow ADC)
-    BaseType_t r3 = xTaskCreatePinnedToCore(
-        HeartbeatTask,
-        "HeartbeatTask",
-        3072,
-        nullptr,
-        2,
-        &heartbeatTaskHandle,
+        3,
+        &environmentTaskHandle,
         0
     );
-    Serial.printf("[Setup] HeartbeatTask spawn result: %s\n", (r3 == pdPASS) ? "SUCCESS" : "FAILED");
 
-    Serial.println("[Setup] FreeRTOS task scheduler started.");
+    // Task 3: Buzzer & Connection Monitor Task on Core 0
+    xTaskCreatePinnedToCore(
+        BuzzerTask,
+        "BuzzerTask",
+        2048,
+        nullptr,
+        2,
+        &buzzerTaskHandle,
+        0
+    );
+
+    Serial.println("[Setup] SafeBand operating tasks started successfully.\n");
 }
 
 void loop() {
-    // Empty. FreeRTOS task scheduler manages the execution loops.
     vTaskDelete(nullptr);
 }
 
-// 1. Sensor Sampler Task (Runs at 100 Hz)
-void IMUSamplerTask(void* pvParameters) {
+// 1. High-Frequency Sampler Task (100 Hz - 10ms interval)
+void SamplerTask(void* pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(SAMPLE_INTERVAL_MS); // 10ms
 
-    IMUData sample;
-    uint32_t rawStreamDivider = 0;
+    IMUData imuSample;
+    VitalData vitalSample;
 
-    Serial.println("[Task] Sampler task active.");
+    Serial.println("[Task] 100 Hz Sampler task active.");
 
     while (1) {
-        // Precise 100 Hz sampling interval
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        uint32_t nowMs = millis();
 
-        // Read sample
-        if (IMUSensor::getInstance().readSample(sample)) {
-            // Push sample to processing queue
-            if (xQueueSend(sampleQueue, &sample, 0) != pdTRUE) {
-                // Queue full: processing task is lagging
-                // Increment drop counters or ignore in normal use
-            }
+        // 1. Read IMU
+        bool imuOk = IMUSensor::getInstance().readSample(imuSample);
+        if (imuOk) {
+            g_latestImu = imuSample;
+            EdgeAnalytics::getInstance().processIMUSample(imuSample);
 
-            // Stream raw data at 25 Hz if streaming is enabled
-            if (BLEManager::getInstance().isStreamingEnabled()) {
-                rawStreamDivider++;
-                if (rawStreamDivider >= 10) { // 100 Hz / 10 = 10 Hz
-                    rawStreamDivider = 0;
-                    
-                    uint16_t msSinceBoot = static_cast<uint16_t>(millis() & 0xFFFF);
-                    float resultant = sqrtf(sample.ax*sample.ax + sample.ay*sample.ay + sample.az*sample.az);
-                    
-                    // Simple jerk estimate for stream (last value difference)
-                    static float lastRes = 0.0f;
-                    float jerk = (resultant - lastRes) * 100.0f;
-                    lastRes = resultant;
-
-                    BLEManager::getInstance().sendSensorPacket(
-                        msSinceBoot,
-                        sample,
-                        resultant,
-                        jerk,
-                        static_cast<uint8_t>(fminf(fmaxf(roundf(currentAnomalyScore / 0.00441764f), 0.0f), 255.0f))
-                    );
-                }
-            } else {
-                rawStreamDivider = 0;
-            }
-        }
-    }
-}
-
-// 2. Feature Extraction and Anomaly Detection Task
-void ProcessingTask(void* pvParameters) {
-    IMUData sample;
-    static float features[TOTAL_FEATURES];
-    uint32_t consecutiveAnomalyWindows = 0;
-    
-    Serial.println("[Task] Processing task active.");
-
-    while (1) {
-        // Read samples from queue (blocking until sample is available)
-        if (xQueueReceive(sampleQueue, &sample, portMAX_DELAY) == pdTRUE) {
-            // Check and process deferred BLE commands in thread-safe context
-            if (BLEManager::getInstance().hasPendingCommand()) {
-                uint8_t cmd = BLEManager::getInstance().getPendingCommand();
-                BLEManager::getInstance().processCommand(cmd);
-            }
-            
-            // Handle active calibration mode
-            if (isCalibrating) {
-                calibAccelSum[0] += sample.ax;
-                calibAccelSum[1] += sample.ay;
-                calibAccelSum[2] += sample.az;
-                calibrationSamplesCollected++;
-                
-                if (calibrationSamplesCollected >= 1000) { // 10 seconds of data
-                    isCalibrating = false;
-                    float meanX = calibAccelSum[0] / 1000.0f;
-                    float meanY = calibAccelSum[1] / 1000.0f;
-                    float meanZ = calibAccelSum[2] / 1000.0f;
-                    Serial.printf("[Calib] Completed! Baseline averages: Ax=%.3fg, Ay=%.3fg, Az=%.3fg\n", meanX, meanY, meanZ);
-                }
-                continue;
-            }
-
-            // Check if calibration was requested via BLE command
-            if (BLEManager::getInstance().isCalibrationRequested()) {
-                BLEManager::getInstance().clearCalibrationRequest();
-                isCalibrating = true;
-                calibrationSamplesCollected = 0;
-                calibAccelSum[0] = calibAccelSum[1] = calibAccelSum[2] = 0.0f;
-                Serial.println("[Calib] Starting 10-second baseline collection. Keep device still.");
-                FeatureExtractor::getInstance().reset();
-                continue;
-            }
-
-            // Add sample to the Feature Engineering sliding window
-            if (FeatureExtractor::getInstance().addSample(sample, features)) {
-                // A new window of 200 samples is ready (triggered every 50 sample stride)
-                
-                 // Monitor wear confidence: track motion variance (trace of covariance matrix at features[1325])
-                 float totalVariance = features[1325];
-                 if (totalVariance < 100.0f) {
-                     g_stillWindowCount++;
-                     if (g_stillWindowCount > 120) g_stillWindowCount = 120; // Cap at 1 minute of stillness
-                 } else if (totalVariance > 1000.0f) {
-                     g_stillWindowCount = 0;
-                     g_wearConfidence = 100; // Active movement resets wear state immediately
-                 } else {
-                     // Moderate variance (100 to 1000): decrement still count to allow still hand to stay worn,
-                     // but prevent single table bumps from resetting wear confidence.
-                     if (g_stillWindowCount > 30) {
-                         g_stillWindowCount -= 30; // 15 seconds credit per active window
-                     } else {
-                         g_stillWindowCount = 0;
-                     }
-                     if (g_stillWindowCount <= 60) {
-                         g_wearConfidence = 100;
-                     }
-                 }
-
-                 if (g_stillWindowCount > 60) { // 60 windows * 0.5s stride = 30 seconds
-                     // Decay wear confidence from 100% to 0% over the next 30 seconds (total 1 minute to 0%)
-                     float decayFraction = (g_stillWindowCount - 60) / 60.0f;
-                     if (decayFraction > 1.0f) decayFraction = 1.0f;
-                     g_wearConfidence = static_cast<uint8_t>((1.0f - decayFraction) * 100.0f);
-                 }
-
-                // Run anomaly detection inference
-                int8_t motionEmbedding[16] = {0};
-                float anomalyScore = ModelRunner::getInstance().runInference(features, motionEmbedding);
-
-                 // Suppress false-positive anomalies when the device is completely still or unworn and not in an active alarm sequence
-                 if ((totalVariance < 100.0f || g_wearConfidence < 40) && consecutiveAnomalyWindows == 0) {
-                     anomalyScore = 0.0f;
-                 }
-
-                currentAnomalyScore = anomalyScore;
-
-                // Accumulate statistics for the 30s heartbeat average
-                runningAnomalySum += anomalyScore;
-                runningAnomalyCount++;
-
-                float twelveFeatures[12] = {
-                    features[1203], // std
-                    features[1212], // rms
-                    features[1221], // skew
-                    features[1230], // kurtosis
-                    features[1239], // zcr
-                    features[1278], // dom_freq
-                    features[1284], // entropy
-                    features[1290], // peak_ratio
-                    features[1314], // band_energy
-                    features[1323], // lambda1_ratio
-                    features[1325], // total_variance
-                    (fabsf(features[1327]) + fabsf(features[1328]) + fabsf(features[1329])) / 3.0f // coupling
-                };
-
-                // Correct feature indexing:
-                // dominantFreq of Ax in last sub-window: index 1278
-                float dominantFreq = features[1278]; 
-
-                 // Motion State Bitmask calculation:
-                 // Bit 0: Still, Bit 1: Periodic, Bit 2: Aperiodic, Bit 3: High-Impact, Bit 4: Restrained
-                 uint8_t motionState = 0;
-                 if (totalVariance < 100.0f) {
-                     motionState |= (1 << 0); // Still
-                } else if (totalVariance > 80000.0f || (features[1212] > 30.0f && totalVariance > 30000.0f)) {
-                    motionState |= (1 << 3); // High-Impact
-                } else if (dominantFreq >= 1.0f && dominantFreq <= 3.0f && features[1290] >= 0.35f) {
-                    motionState |= (1 << 1); // Periodic (walking/running rhythm)
-                } else {
-                    motionState |= (1 << 2); // Aperiodic (struggle/random)
-                }
-
-                 // Check for post-impact restraint (low variance during alarm countdown)
-                 if (consecutiveAnomalyWindows > 6 && totalVariance < 100.0f) {
-                     motionState |= (1 << 4); // Restrained
-                 }
-
-                if (ModelRunner::getInstance().isTensorsAllocated()) {
-                    motionState |= (1 << 7); // Bit 7: Model Allocated successfully
-                }
-
-                uint8_t scaledScore = static_cast<uint8_t>(fminf(fmaxf(roundf(anomalyScore / 0.00441764f), 0.0f), 255.0f));
-
-                // Send live 2 Hz feature stream to the mobile app for dynamic gauges
-                if (BLEManager::getInstance().isConnected()) {
-                    BLEManager::getInstance().sendFeaturePacket(
-                        0, // Will be set/incremented inside BLEManager
-                        scaledScore,
-                        motionState,
-                        static_cast<uint8_t>(dominantFreq * 2.0f),
-                        static_cast<uint8_t>(features[1239] * 255.0f), // ZCR of Resultant
-                        static_cast<uint8_t>(features[1284] * 255.0f), // Spectral Entropy Ax
-                        static_cast<uint16_t>(features[1323] * 1000.0f), // Eigenvalue linearity ratio
-                        g_wearConfidence,
-                        static_cast<uint16_t>(features[1212] * 1.5f * 101.97162f), // Peak accel proxy (Resultant RMS)
-                        static_cast<uint16_t>(consecutiveAnomalyWindows * 5), // Duration in 100ms units
-                        motionEmbedding,
-                        0, // isThreat = 0 (Normal)
-                        twelveFeatures
-                    );
-                }
-
-                // Evaluate Hysteresis Anomaly Logic (Suppressed if unworn)
-                if (anomalyScore > DEFAULT_THRESHOLD && g_wearConfidence >= 40) {
-                    consecutiveAnomalyWindows++;
-                    Serial.printf("[Inference] Alert! Score = %.3f (Consecutive: %d)\n", anomalyScore, consecutiveAnomalyWindows);
-                    
-                    if (consecutiveAnomalyWindows >= HYSTERESIS_WINDOWS) {
-                        // Sustained anomaly detected! Trigger event notification
-                        if (!BLEManager::getInstance().isEventAcknowledged()) {
-                            
-                            // Scale confidence based on persistence
-                            uint8_t confidence = 33;
-                            if (consecutiveAnomalyWindows >= 11) confidence = 99;
-                            else if (consecutiveAnomalyWindows >= 8) confidence = 66;
-
-                            uint8_t durationUnits = static_cast<uint8_t>(consecutiveAnomalyWindows * 5); // Stride 50 samples = 0.5s = 5 units
-
-                            BLEManager::getInstance().sendFeaturePacket(
-                                0, // seq
-                                scaledScore,
-                                motionState,
-                                static_cast<uint8_t>(dominantFreq * 2.0f),
-                                static_cast<uint8_t>(features[1239] * 255.0f), // ZCR of Resultant
-                                static_cast<uint8_t>(features[1284] * 255.0f), // Spectral Entropy Ax
-                                static_cast<uint16_t>(features[1323] * 1000.0f), // Eigenvalue linearity ratio
-                                g_wearConfidence,
-                                static_cast<uint16_t>(features[1212] * 1.5f * 101.97162f), // Peak accel proxy (Resultant RMS)
-                                static_cast<uint16_t>(consecutiveAnomalyWindows * 5), // Duration in 100ms units
-                                motionEmbedding,
-                                1, // isThreat = 1 (Threat Alert Event!)
-                                twelveFeatures
-                            );
-                        }
-                    }
-                } else {
-                    // Reset consecutive window counter when score falls below threshold or device is unworn
-                    if (consecutiveAnomalyWindows > 0) {
-                        Serial.printf("[Inference] Normal/Unworn. Score = %.3f. Resetting alarm counter.\n", anomalyScore);
-                        consecutiveAnomalyWindows = 0;
-                        BLEManager::getInstance().setEventAcknowledged(false); // Reset ack for next event
-                    }
-                }
-            }
-        }
-    }
-}
-
-// 3. Heartbeat and Status Monitoring Task (Runs checks every 500ms, sends status every 30s)
-void HeartbeatTask(void* pvParameters) {
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(500); // Check status every 500ms
-    uint32_t statusCounter = 0;
-
-    Serial.println("[Task] Heartbeat status task active.");
-
-    while (1) {
-        // Run every 500ms
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-
-        // Manage connection events and re-advertising
-        BLEManager::getInstance().handleConnectionStatus();
-
-        statusCounter++;
-        if (statusCounter >= 60) { // 60 * 500ms = 30 seconds
-            statusCounter = 0;
-
+            // Mode 1 (BLE ON): Transmit 0x01 Motion Packet @ 100 Hz
             if (BLEManager::getInstance().isConnected()) {
-                uint8_t batteryPct = PowerManager::getInstance().readBatteryPercentage();
-                uint16_t uptimeMinutes = static_cast<uint16_t>(millis() / 60000);
-                
-                // Calculate 60s rolling average anomaly score
-                uint8_t avgAnomaly = 0;
-                if (runningAnomalyCount > 0) {
-                    avgAnomaly = static_cast<uint8_t>(fminf(fmaxf(roundf((runningAnomalySum / runningAnomalyCount) / 0.00441764f), 0.0f), 255.0f));
-                    // Reset rolling accumulations
-                    runningAnomalySum = 0.0f;
-                    runningAnomalyCount = 0;
-                }
-
-                // Wear confidence based on sensor activity monitoring over time
-                uint8_t wearConfidence = g_wearConfidence; 
-
-                // Send standard Status Packet (Type 0x02)
-                BLEManager::getInstance().sendStatusPacket(
-                    batteryPct,
-                    wearConfidence,
-                    systemFlags,
-                    uptimeMinutes,
-                    avgAnomaly,
-                    20 // 2.0 Hz inference rate (multiplied by 10)
-                );
-                
-                 Serial.printf("[Heartbeat] Status Packet Sent. Uptime: %d mins, Battery: %d%%, WearConfidence: %d%%\n", uptimeMinutes, batteryPct, wearConfidence);
+                BLEManager::getInstance().sendMotionPacket(nowMs, imuSample);
             }
         }
+
+        // 2. Read Vitals (MAX30102)
+        bool vitalOk = VitalSensor::getInstance().readSample(vitalSample);
+        if (vitalOk) {
+            g_latestVital = vitalSample;
+            EdgeAnalytics::getInstance().processVitalSample(vitalSample);
+
+            // Mode 1 (BLE ON): Transmit 0x04 Vital Packet @ 100 Hz
+            if (BLEManager::getInstance().isConnected() && vitalSample.fingerDetected) {
+                BLEManager::getInstance().sendVitalPacket(nowMs, vitalSample.red, vitalSample.ir, vitalSample.signalQuality);
+            }
+        }
+    }
+}
+
+// 2. Environment & Serial Diagnostics Task (1 Hz - 1000ms interval)
+void EnvironmentTask(void* pvParameters) {
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(1000); // 1000ms (1 Hz)
+
+    EnvironmentData envSample;
+    uint32_t diagCounter = 0;
+
+    Serial.println("[Task] 1 Hz Environment & Diagnostics task active.");
+
+    while (1) {
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        uint32_t nowMs = millis();
+
+        // 1. Read Environment Sensor (BMP280 / BME280)
+        EnvironmentSensor::getInstance().readSample(envSample);
+        g_latestEnv = envSample;
+
+        // Ingest into Edge Analytics Engine
+        EdgeAnalytics::getInstance().processEnvironmentSample(envSample);
+
+        // Mode 1 (BLE ON): Transmit 0x03 Environment Packet @ 1 Hz
+        if (BLEManager::getInstance().isConnected()) {
+            BLEManager::getInstance().sendEnvironmentPacket(
+                nowMs,
+                envSample.temperature,
+                envSample.pressure,
+                envSample.humidity
+            );
+        }
+
+        // 2. Battery & Status Packet Check (0x02)
+        uint8_t currentBatteryPct = PowerManager::getInstance().readBatteryPercentage();
+        bool batteryChanged = (currentBatteryPct != lastReportedBatteryPct);
+        bool periodicIntervalElapsed = (nowMs - lastStatusPacketTimeMs >= 300000); // 5 minutes
+
+        if ((batteryChanged || periodicIntervalElapsed) && BLEManager::getInstance().isConnected()) {
+            lastReportedBatteryPct = currentBatteryPct;
+            lastStatusPacketTimeMs = nowMs;
+
+            uint32_t uptimeSec = nowMs / 1000;
+            uint8_t isBleConn = BLEManager::getInstance().isConnected() ? 1 : 0;
+
+            BLEManager::getInstance().sendStatusPacket(
+                currentBatteryPct,
+                FIRMWARE_VERSION_MAJOR,
+                FIRMWARE_VERSION_MINOR,
+                uptimeSec,
+                isBleConn
+            );
+        }
+
+        // 3. Periodic Real-Time Serial Diagnostics (every 2 seconds)
+        diagCounter++;
+        if (diagCounter >= 2) {
+            diagCounter = 0;
+            const char* modeStr = BLEManager::getInstance().isConnected() ? "BLE ON (Streaming)" : "BLE OFF (Local Sensing)";
+            const char* actStr = EdgeAnalytics::getInstance().getActivityString();
+            bool fallPending = EdgeAnalytics::getInstance().isFallAlarmPending();
+            uint32_t fallSec = EdgeAnalytics::getInstance().getFallCountdownRemainingSec();
+
+            Serial.println("==================== [REAL-TIME SYSTEM MONITOR] ====================");
+            Serial.printf("MODE: %s | Uptime: %lus | Battery: %d%%\n", modeStr, nowMs / 1000, currentBatteryPct);
+            Serial.printf("[MOTION] State: %-7s | Ax: %5.2fg, Ay: %5.2fg, Az: %5.2fg | Gx: %6.1fdps, Gy: %6.1fdps, Gz: %6.1fdps\n",
+                          actStr, g_latestImu.ax, g_latestImu.ay, g_latestImu.az, g_latestImu.gx, g_latestImu.gy, g_latestImu.gz);
+            Serial.printf("[VITALS] Finger: %-3s | HR: %5.1f bpm | SpO2: %5.1f%% | SignalQuality: %3d%%\n",
+                          g_latestVital.fingerDetected ? "YES" : "NO", g_latestVital.heartRate, g_latestVital.spo2, g_latestVital.signalQuality);
+            Serial.printf("[ENV]    Temp: %5.1f°C | Press: %6.1f hPa | Humid: %4.1f%% | HeatIndex: %5.1f°F (%s)\n",
+                          envSample.temperature, envSample.pressure, envSample.humidity, envSample.heatIndexF,
+                          envSample.heatIndexF >= HEAT_INDEX_DANGER ? "DANGER" :
+                          envSample.heatIndexF >= HEAT_INDEX_EXTREME_CAUTION ? "EXTREME CAUTION" :
+                          envSample.heatIndexF >= HEAT_INDEX_CAUTION ? "CAUTION" : "NORMAL");
+            Serial.printf("[ALERTS] Fall Alarm: %s%s\n",
+                          fallPending ? "COUNTDOWN ACTIVE (" : "IDLE",
+                          fallPending ? (String(fallSec) + "s remaining)").c_str() : "");
+            Serial.println("====================================================================\n");
+        }
+    }
+}
+
+// 3. Buzzer & BLE Status Manager Task (Runs every 20ms)
+void BuzzerTask(void* pvParameters) {
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(20);
+
+    while (1) {
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+        // Non-blocking buzzer tone execution
+        BuzzerManager::getInstance().update();
+
+        // Monitor BLE connection / re-advertising
+        BLEManager::getInstance().handleConnectionStatus();
     }
 }
