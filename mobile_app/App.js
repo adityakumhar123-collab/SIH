@@ -315,40 +315,24 @@ export default function App() {
     setDbSettings,
   } = useDatabase(addLog);
 
-  const handleRunReclustering = () => {
+  const handleRecalibrateBaselines = () => {
     try {
-      const ver = BackgroundServices.runClusteringService(3);
-      if (ver) {
-        addLog(`[CLUSTERING] Reclustering run successful. Generated Version ${ver} centroids.`, 'SYSTEM');
-        // Start background batch reassignment
-        let hasMore = true;
-        const interval = setInterval(() => {
-          try {
-            hasMore = BackgroundServices.runHistoricalReassignment(100);
-            if (!hasMore) {
-              clearInterval(interval);
-              addLog('[CLUSTERING] Historical reassignment completed successfully.', 'SYSTEM');
-            } else {
-              addLog('[CLUSTERING] Historical reassignment batch completed.', 'SYSTEM');
-            }
-          } catch (err) {
-            clearInterval(interval);
-            addLog(`[CLUSTERING] Reassignment error: ${err.message}`, 'SYSTEM');
-          }
-        }, 1000);
+      const res = BackgroundServices.recalibrateBaselines();
+      if (res && res.success) {
+        addLog(`[BASELINES] Recalibrated baselines across ${res.locationsChecked} location nodes.`, 'SYSTEM');
       } else {
-        addLog(`[CLUSTERING] Reclustering skipped or aborted by validation gates.`, 'SYSTEM');
+        addLog(`[BASELINES] Recalibration: ${res?.error || 'Complete'}`, 'SYSTEM');
       }
     } catch (e) {
-      addLog(`[CLUSTERING] Failed: ${e.message}`, 'SYSTEM');
+      addLog(`[BASELINES] Failed: ${e.message}`, 'SYSTEM');
     }
   };
 
   const handleRunCleanup = () => {
     try {
-      const stats = BackgroundServices.runDatabaseCleanup();
+      const stats = BackgroundServices.runDatabaseCleanup(30);
       if (stats) {
-        addLog(`[DB] Database cleanup: deleted ${stats.deletedObservations} observations, ${stats.deletedTimelines} timelines, and ${stats.deletedInferences} inferences.`, 'SYSTEM');
+        addLog(`[DB] Database cleanup: deleted ${stats.deletedEpisodes} episodes, ${stats.deletedVisits} visits, and ${stats.deletedEvents} events.`, 'SYSTEM');
       }
     } catch (e) {
       addLog(`[DB] Cleanup failed: ${e.message}`, 'SYSTEM');
@@ -396,35 +380,30 @@ export default function App() {
   const lastLoggedScoreRef = useRef(-1);
 
   // ===========================================================================
-  // TIMER LOOP 1: 3-Second Context Inference (Heavy DB Operations)
+  // TIMER LOOP 1: 3-Second Context Inference (Familiarity & Location Tracking)
   // Decoupled from the 2 Hz BLE stream to prevent lagging.
-  // Periodically extracts recent observations/episodes and compares them
-  // against historical 30-day baseline data to compute familiarity (L1, L2, L3).
   // ===========================================================================
   useEffect(() => {
     const timer = setInterval(() => {
       // Build current telemetry packet from refs to avoid capture of stale state
       const packetForEngine = { ...currentPacketRef.current, wearConfidence: wearConfidenceRef.current };
       try {
-        // Query SQLite and run spatial/temporal/behavioral comparison
         const famResult = ContextEngine.runInference(packetForEngine);
-        setFamLevel1(famResult.familiarityLevel1);
-        setFamLevel2(famResult.familiarityLevel2);
-        setFamFinal(famResult.familiarityFinal);
+        if (famResult && famResult.familiarityScore !== undefined) {
+          setFamFinal(famResult.familiarityScore);
+        }
       } catch (err) {
         console.warn('[Context Timer] Inference failed:', err);
       }
     }, 3000); // 3-second tick rate
 
-    return () => clearInterval(timer); // Release timer on unmount
+    return () => clearInterval(timer);
   }, []);
 
   // ===========================================================================
   // EVALUATION LOOP 2: 2 Hz Threat Score Recalculation (Lightweight Math Only)
   // Runs whenever a new BLE feature packet is received, wear confidence updates,
   // or the 3-second familiarity score changes.
-  // Performs the step-by-step threat scaling, applies duration/motion weights,
-  // logs results, and triggers the 15-second pre-alert countdown if score >= 72%.
   // ===========================================================================
   useEffect(() => {
     // Merge packet fields and wear confidence state
@@ -432,6 +411,7 @@ export default function App() {
 
     // Compute base threat score and explanation logs
     const { score, score3s, score3m, score5m, explanation } = computeThreatScoreDetailed(packetForEngine, {
+      familiarityScore: famFinal,
       cooldownActive: cooldownActive || (cooldownActiveRef && cooldownActiveRef.current)
     });
 
@@ -447,9 +427,9 @@ export default function App() {
       lastLoggedScoreRef.current = finalScore;
       if (explanation && explanation.length > 0) {
         const batch = explanation.map(msg => ({ message: msg, category: 'CONTEXT' }));
-        batch.push({ message: `▶ Final threat: ${Math.round(finalScore * 100)}% (TinyML raw: ${currentPacket.anomalyScore}/255)`, category: 'CONTEXT' });
+        batch.push({ message: `▶ RakshaBand Threat: ${Math.round(finalScore * 100)}% | Vitals: HR ${currentPacket.hr || '--'}, SpO2 ${currentPacket.spo2 || '--'}%`, category: 'CONTEXT' });
         batch.push({ message: '─────────────────────────────────────────', category: 'CONTEXT' });
-        addLogs(batch); // Log to local diagnostics terminal
+        addLogs(batch);
       }
     }
 
@@ -457,11 +437,11 @@ export default function App() {
     //  - Threat score >= 72%
     //  - No alert is currently active (alertTriggeredRef.current is false)
     //  - Alerts are not already dispatched (isDispatched is false)
-    //  - We are not in the 20-second post-cancel cooldown
+    //  - We are not in cooldown
     if (finalScore >= 0.72 && !alertTriggeredRef.current && !isDispatched && !cooldownActive && !(cooldownActiveRef && cooldownActiveRef.current)) {
-      alertTriggeredRef.current = true; // Lock immediately to prevent double-triggers
+      alertTriggeredRef.current = true;
       addLog(`🚨 EMERGENCY THREAT DETECTED: Score ${Math.round(finalScore * 100)}% >= 72%. Triggering countdown.`, 'SYSTEM');
-      triggerEmergencyPreAlert(); // Show countdown UI
+      triggerEmergencyPreAlert();
     }
   }, [currentPacket, wearConfidence, famFinal, cooldownActive]);
 
@@ -656,7 +636,8 @@ export default function App() {
             twilioBalanceError={twilioBalanceError}
             checkTwilioBalance={checkTwilioBalance}
             handleToggleGlobalChannel={handleToggleGlobalChannel}
-            handleRunReclustering={handleRunReclustering}
+            handleRecalibrateBaselines={handleRecalibrateBaselines}
+            handleRunReclustering={handleRecalibrateBaselines}
             handleRunCleanup={handleRunCleanup}
           />
         )}
@@ -757,7 +738,9 @@ export default function App() {
               // Countdown State
               <View style={styles.alignCenter}>
                 <Text style={styles.overlayAlertHeader}>🚨 HIGH THREAT DETECTED</Text>
-                <Text style={styles.overlaySubheader}>Possible physical danger or fall detected.</Text>
+                <Text style={styles.overlaySubheader}>
+                  {currentPacket.diagnostic ? currentPacket.diagnostic.primary_hypothesis : 'Physical danger or acute health anomaly'}
+                </Text>
 
                 {/* Large countdown circle */}
                 <View style={styles.countdownWrapper}>
@@ -766,8 +749,10 @@ export default function App() {
                 </View>
 
                 <Text style={styles.alertExplanation}>
-                  SafeBand context engine threat score reached **{Math.round(threatScore * 100)}%**.
-                  Emergency messages will be dispatched automatically when the timer expires.
+                  {currentPacket.diagnostic?.gemma_message ||
+                    (currentPacket.diagnostic?.contributing_evidence && currentPacket.diagnostic.contributing_evidence.length > 0
+                      ? currentPacket.diagnostic.contributing_evidence.join(', ')
+                      : `RakshaBand diagnostic threat score reached ${Math.round(threatScore * 100)}%. Emergency contacts will be alerted.`)}
                 </Text>
 
                 <TouchableOpacity delayPressIn={0} style={styles.cancelBtn} onPress={() => {

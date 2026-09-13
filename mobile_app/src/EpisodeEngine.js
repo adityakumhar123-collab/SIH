@@ -1,115 +1,86 @@
 // =============================================================================
-// EpisodeEngine.js — Motion Continuity Segmentation and Episode Tracking
+// EpisodeEngine.js — Multi-Sensor Continuity Segmentation & Inference Orchestrator
 // =============================================================================
 //
-// DRY RUN / ARCHITECTURE OVERVIEW
-// --------------------------------
-// EpisodeEngine converts the stream of short Observations (every 3s from
-// MotionEngine) into a continuous timeline of "Episodes" — longer segments of
-// sustained, dominant motion behavior.
-//
-// WHAT IS AN EPISODE?
-//   An "episode" is a period of time during which the wearer's dominant motion
-//   cluster remains the same. Examples:
-//     - Walking (cluster 1) for 4 minutes → one episode
-//     - Running (cluster 2) for 1 minute → second episode
-//   When the dominant cluster changes, the current episode is CLOSED and a new
-//   one STARTS. This gives a high-level timeline: "user walked 4 min, then ran 1 min."
-//
-// DATA FLOW:
-//   MotionEngine.buildObservation()
-//     ↓ (returns Observation every 3 seconds)
-//   useBle.js calls EpisodeEngine.updateEpisode(obs, familiarityScore)
-//     ↓
-//   EpisodeEngine decides: CREATE new episode | EXTEND current | CLOSE + CREATE
-//     ↓
-//   Writes to SQLite via: saveEpisode() + saveEpisodeTimeline()
-//     ↓ (the final persisted episodes are queried by ContextEngine.runInference)
-//   Output → returns current activeEpisode to useBle.js (for dashboard logs)
-//
-// FILES USED:
-//   → Database.js for: saveEpisode, saveEpisodeTimeline, getIsoDateString,
-//                       getIsoTimeString, initDatabase
-//
-// OUTPUT:
-//   → Stored rows in `episodes` and `episode_motion_timelines` SQLite tables
-//   → The activeEpisode object is returned to useBle.js (used in log messages)
-//
-// FAMILIARITY STATISTICS:
-//   Each episode tracks the familiarity score (from LocationEngine) at each
-//   3-second stride using Welford's Online Algorithm for numerically stable
-//   running mean and variance (avoids catastrophic cancellation from large sums).
-//
-// BUGS / NOTES:
-//   ⚠ The stride duration is hardcoded to 3.0 seconds (each observation from
-//     MotionEngine = 10 packets × 500ms stride = 5s window, but with 3s stride
-//     timing). If inference rate changes, this hardcoded value would need updating.
-//   ⚠ restoreActiveEpisode() reconnects to any open episode from a previous
-//     session if the app was closed mid-session. This correctly recovers state
-//     across app restarts, but the Welford M2 is only APPROXIMATED (M2 = variance
-//     × n), which loses precision if the distribution was non-normal.
+// RakshaBand Episode Engine:
+// 1. Buffers raw 100 Hz IMU data into 200-sample windows (stride = 50 samples = 2 Hz)
+// 2. Extracts Tier 1 (90 stats), Tier 2 (42 spectral), Tier 3 (12 covariance) features
+// 3. Generates 32D unit embeddings and classifies against 21 class centroids
+// 4. Extracts PPG vitals (Heart Rate, SpO2, HRV) and NOAA Heat Index
+// 5. Applies 10-window debounce boundary rule (>= 8 new class = transition)
+// 6. Persists continuous multi-sensor episodes to SQLite (`episodes` table)
+// 7. Evaluates Mathematical Engine & Diagnostic Reasoning Engine on each inference tick
 // =============================================================================
 
 import {
-  initDatabase,       // Required for restoreActiveEpisode() raw DB query
-  saveEpisode,        // Upsert an episode row (insert if new, update if existing)
-  saveEpisodeTimeline, // Append one timeline entry for this observation stride
-  getIsoDateString,   // "YYYY-MM-DD"
-  getIsoTimeString    // "HH:MM:SS"
+  saveEpisode,
+  getActiveEpisode,
+  storeDiagnosticEvent
 } from './Database.js';
+import {
+  extractWindowFeatures,
+  standardizeFeatures,
+  classifyEmbedding,
+  generateFallbackEmbedding,
+  processPpgWaveform,
+  computeHeatIndex
+} from './FeatureExtraction.js';
+import { MathematicalEngine } from './MathematicalEngine.js';
+import { DiagnosticReasoningEngine } from './DiagnosticReasoningEngine.js';
+import { GemmaService } from './GemmaService.js';
+import { LocationEngine } from './LocationEngine.js';
 
 class EpisodeEngineClass {
   constructor() {
-    // The currently open (unfinished) Episode object, or null if no episode is active.
-    // Mirrors the database row — any field changes here must be saved to DB.
     this.activeEpisode = null;
+    this.imuBuffer = [];       // Array of [ax, ay, az, gx, gy, gz] samples
+    this.redBuffer = [];       // Raw Red channel samples (100 Hz)
+    this.irBuffer = [];        // Raw IR channel samples (100 Hz)
+    this.latestEnv = { tempC: 24.0, pressHpa: 1013.25, humPct: 50.0 };
 
-    // Count of timeline entries (strides) saved for the active episode.
-    // Used as the denominator 'n' for Welford's online mean/variance.
-    this.timelineLength = 0;
+    this.WINDOW_SIZE = 200;    // 2.0s at 100 Hz
+    this.STRIDE_SIZE = 50;     // 0.5s stride = 2.0 Hz tick
+    this.classificationHistory = []; // Last 10 activity classifications for debounce
 
-    // Running "M2" accumulator for Welford's online variance algorithm.
-    // M2 = sum of squared deviations from the running mean.
-    // variance = M2 / n (biased). This avoids storing all familiarity scores.
-    this.runningFamiliarityM2 = 0.0;
+    // Running physiological & environmental telemetry accumulators
+    this.sampleCounts = 0;
+    this.hrAccumulator = [];
+    this.spo2Accumulator = [];
+    this.tempAccumulator = [];
+    this.heatIndexAccumulator = [];
+    this.accelRmsAccumulator = [];
+
+    // Current real-time state exposed to UI
+    this.currentVitals = { hr: 72, spo2: 98.0, hrv: 45.0 };
+    this.currentHeatIndex = { heatIndexF: 75.0, tier: 'NORMAL', riskLevel: 0 };
+    this.currentActivity = { activityClass: 'standing', confidence: 1.0 };
+    this.currentDiagnostic = null;
+    this.anomalyPersistenceMinutes = 0;
+    this.anomalyStartTimestamp = 0;
   }
 
-  // Called when BLE connects (from useBle.js). Resets in-memory state and
-  // tries to restore any previously-open episode from the database.
   initialize() {
-    this.activeEpisode = null;
-    this.timelineLength = 0;
-    this.runningFamiliarityM2 = 0.0;
-    this.restoreActiveEpisode(); // Resume any session that was open before app restart
+    this.imuBuffer = [];
+    this.redBuffer = [];
+    this.irBuffer = [];
+    this.classificationHistory = [];
+    this.sampleCounts = 0;
+    this.hrAccumulator = [];
+    this.spo2Accumulator = [];
+    this.tempAccumulator = [];
+    this.heatIndexAccumulator = [];
+    this.accelRmsAccumulator = [];
+
+    MathematicalEngine.initialize();
+    this.restoreActiveEpisode();
   }
 
-  // Queries the DB for any episode row where end_date IS NULL (= still open).
-  // If found, restores it as the activeEpisode and reconstructs the Welford M2
-  // accumulator from the stored variance so running stats remain consistent.
   restoreActiveEpisode() {
     try {
-      const db = initDatabase();
-      // Fetch the most-recently opened episode that has no end date (= still running)
-      const openEpisode = db.getFirstSync('SELECT * FROM episodes WHERE end_date IS NULL ORDER BY episode_id DESC LIMIT 1;');
-      
+      const openEpisode = getActiveEpisode();
       if (openEpisode) {
-        // Parse the JSON-serialized motion_distribution back to an object
-        openEpisode.motion_distribution = JSON.parse(openEpisode.motion_distribution);
-        
-        // Count existing timeline entries to restore the correct Welford 'n'
-        const countRow = db.getFirstSync(
-          'SELECT COUNT(*) as count FROM episode_motion_timelines WHERE episode_id = ?;',
-          [openEpisode.episode_id]
-        );
-        this.timelineLength = countRow ? countRow.count : 0;
-        
-        // Approximate M2 from stored variance: M2 = variance × n (biased form)
-        // NOTE: This is an approximation — exact M2 cannot be recovered without
-        // all original data points. In practice, the error is acceptable.
-        this.runningFamiliarityM2 = (openEpisode.familiarity_variance || 0.0) * this.timelineLength;
         this.activeEpisode = openEpisode;
-        
-        console.log(`[EpisodeEngine] Restored open Episode ID: ${openEpisode.episode_id}. Stride count: ${this.timelineLength}`);
+        console.log(`[EpisodeEngine] Restored open Episode ID: ${openEpisode.episode_id} (${openEpisode.activity_class})`);
       } else {
         this.activeEpisode = null;
       }
@@ -119,212 +90,288 @@ class EpisodeEngineClass {
     }
   }
 
-  // Main entry point — called by useBle.js for every Observation returned by MotionEngine.
-  // Evaluates what the dominant motion cluster of this observation is, then decides
-  // whether to CREATE, EXTEND, or CLOSE+CREATE an episode.
-  //
-  // @param observation   - The Observation object from MotionEngine.buildObservation()
-  // @param familiarityScore - A 0.0–1.0 float from LocationEngine.estimateFamiliarity(),
-  //                          or null if GPS is unavailable
-  // @returns             - The current activeEpisode (or null if nothing is open)
-  updateEpisode(observation, familiarityScore = null) {
-    if (!observation) return null;
-
-    // 1. Determine the dominant motion state for this observation:
-    //    Find the cluster with the highest probability in cluster_distribution.
-    //    e.g. { "1": 0.7, "2": 0.3 } → dominantState = "1"
-    let dominantState = '0'; // Default / Unlabeled cluster (no centroids loaded)
-    let maxProb = -1;
-
-    if (observation.cluster_distribution && Object.keys(observation.cluster_distribution).length > 0) {
-      for (const [clusterId, prob] of Object.entries(observation.cluster_distribution)) {
-        if (prob > maxProb) {
-          maxProb = prob;
-          dominantState = clusterId;
-        }
-      }
+  // Ingest raw 100 Hz Motion Sample [ax, ay, az, gx, gy, gz]
+  pushMotionSample(sample) {
+    this.imuBuffer.push(sample);
+    if (this.imuBuffer.length > 300) {
+      this.imuBuffer.splice(0, this.imuBuffer.length - 200);
     }
-
-    // 2. State Machine: Evaluate Episode Transitions
-    if (!this.activeEpisode) {
-      // State: No open episode → CREATE one for this observation's dominant cluster
-      this.createEpisode(observation, dominantState, familiarityScore);
-    } else {
-      // State: Episode currently open — find its dominant cluster
-      const currentEpisodeDominant = this.getEpisodeDominantState(this.activeEpisode);
-
-      if (dominantState === currentEpisodeDominant) {
-        // Dominant cluster UNCHANGED → EXTEND the current episode by one stride
-        this.extendEpisode(observation, familiarityScore);
-      } else {
-        // Dominant cluster CHANGED → CLOSE the old episode, CREATE a new one
-        this.closeEpisode(observation); // Close with this obs's timestamp as the end
-        this.createEpisode(observation, dominantState, familiarityScore);
-      }
-    }
-
-    return this.activeEpisode;
   }
 
-  // Creates a brand new Episode in the database. Called when:
-  //   (a) There was no previously open episode, or
-  //   (b) The dominant motion cluster just changed.
-  createEpisode(obs, dominantState, familiarityScore) {
-    const fam = familiarityScore !== null ? familiarityScore : null;
-    this.timelineLength = 1;         // First stride = 1
-    this.runningFamiliarityM2 = 0.0; // No variance yet with a single sample
+  // Ingest raw 100 Hz Vital Sample (red, ir)
+  pushVitalSample(red, ir) {
+    this.redBuffer.push(red);
+    this.irBuffer.push(ir);
+    if (this.redBuffer.length > 200) {
+      this.redBuffer.shift();
+      this.irBuffer.shift();
+    }
+  }
 
-    // Construct the episode object in memory first
-    this.activeEpisode = {
-      start_date: obs.date,
-      start_time: obs.time,
-      end_date: null,   // null = episode is OPEN (still ongoing)
-      end_time: null,
-      duration: 3.0,    // First stride = 3 seconds (hardcoded stride duration)
-      motion_distribution: { ...obs.cluster_distribution }, // Clone to avoid mutation
-      familiarity_mean: fam,
-      familiarity_min: fam,
-      familiarity_max: fam,
-      familiarity_variance: 0.0
+  // Ingest 1 Hz Environment Reading (tempC, pressHpa, humPct)
+  pushEnvironmentSample(tempC, pressHpa, humPct) {
+    this.latestEnv = { tempC, pressHpa, humPct };
+  }
+
+  /**
+   * Evaluates the sliding window if 200 samples have accumulated.
+   * Runs feature extraction, Model v3 inference, debouncing, and reasoning.
+   * Returns complete telemetry packet or null if accumulating.
+   */
+  processWindow() {
+    if (this.imuBuffer.length < this.WINDOW_SIZE) {
+      return null;
+    }
+
+    const window = this.imuBuffer.slice(0, this.WINDOW_SIZE);
+    this.imuBuffer.splice(0, this.STRIDE_SIZE); // Slide by 50 samples (0.5s)
+
+    // 1. Feature Extraction (Tier 1, 2, 3)
+    let seqRaw, globRaw;
+    try {
+      const feats = extractWindowFeatures(window);
+      seqRaw = feats.seqRaw;
+      globRaw = feats.globRaw;
+    } catch (err) {
+      console.warn('[EpisodeEngine] Feature extraction failed:', err);
+      return null;
+    }
+
+    // 2. Standardization & 32D Unit Embedding
+    const { seqNorm, globNorm } = standardizeFeatures(seqRaw, globRaw);
+    const embedding = generateFallbackEmbedding(seqNorm, globNorm);
+
+    // 3. 21-Class Cosine Activity Classification
+    const { activityClass, confidence } = classifyEmbedding(embedding);
+    this.currentActivity = { activityClass, confidence };
+
+    // 4. PPG Waveform Processing (HR, SpO2, HRV)
+    const ppg = processPpgWaveform(this.redBuffer, this.irBuffer);
+    if (ppg.hr > 0) {
+      this.currentVitals = { hr: ppg.hr, spo2: ppg.spo2, hrv: ppg.hrv };
+    }
+
+    // 5. Environmental Heat Index
+    const heat = computeHeatIndex(this.latestEnv.tempC, this.latestEnv.humPct);
+    this.currentHeatIndex = heat;
+
+    // 6. Update Location Engine with latest vitals context
+    if (LocationEngine.currentGps) {
+      LocationEngine.onLocationUpdate(LocationEngine.currentGps, {
+        tempC: this.latestEnv.tempC,
+        humidityPct: this.latestEnv.humPct,
+        restingHr: this.currentVitals.hr
+      });
+    }
+
+    // 7. Calculate RMS & peak acceleration for this window
+    let sumAccelSq = 0.0;
+    let maxAccelMg = 0.0;
+    for (let i = 0; i < this.WINDOW_SIZE; i++) {
+      const s = window[i];
+      const mag = Math.sqrt(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+      sumAccelSq += mag * mag;
+      const magMg = (mag / 9.80665) * 1000.0;
+      if (magMg > maxAccelMg) maxAccelMg = magMg;
+    }
+    const accelRms = Math.sqrt(sumAccelSq / this.WINDOW_SIZE);
+    const eigenvalueRatio = globRaw[3]; // Linearity feature
+
+    // 8. Mathematical Engine Mahalanobis Baselines
+    const physEval = MathematicalEngine.evaluateDomain(
+      'physiology',
+      [this.currentVitals.hr, this.currentVitals.spo2]
+    );
+    const envEval = MathematicalEngine.evaluateDomain(
+      'environment',
+      [this.latestEnv.tempC, this.latestEnv.humPct, this.latestEnv.pressHpa]
+    );
+
+    // Track anomaly duration (persistence minutes)
+    const isAnomalous = physEval.isOutlier || envEval.isOutlier || heat.riskLevel >= 2;
+    if (isAnomalous) {
+      if (this.anomalyStartTimestamp === 0) this.anomalyStartTimestamp = Date.now();
+      this.anomalyPersistenceMinutes = Number(((Date.now() - this.anomalyStartTimestamp) / 60000.0).toFixed(1));
+    } else {
+      this.anomalyStartTimestamp = 0;
+      this.anomalyPersistenceMinutes = 0;
+      // Normal state: admit sample to update baseline EWMA
+      MathematicalEngine.updateBaselineEWMA(
+        'physiology',
+        [this.currentVitals.hr, this.currentVitals.spo2],
+        'global',
+        false
+      );
+    }
+
+    // 9. Diagnostic Reasoning Engine Evaluation
+    const currentLocId = LocationEngine.activeVisit ? LocationEngine.activeVisit.location_id : null;
+    const diagnosticContract = DiagnosticReasoningEngine.evaluate({
+      physEval,
+      envEval,
+      heatIndex: heat,
+      activityClass,
+      activityConfidence: confidence,
+      peakAccelMg: maxAccelMg,
+      eigenvalueRatio,
+      hr: this.currentVitals.hr,
+      spo2: this.currentVitals.spo2,
+      locationId: currentLocId,
+      persistenceMinutes: this.anomalyPersistenceMinutes
+    });
+    this.currentDiagnostic = diagnosticContract;
+
+    // Asynchronously generate Gemma explanation and log if non-unclear
+    if (diagnosticContract.primary_hypothesis !== 'ANOMALY_UNCLEAR') {
+      GemmaService.generateGuidance(diagnosticContract).then(gemmaRes => {
+        diagnosticContract.gemma_message = gemmaRes.userMessage;
+        diagnosticContract.recommended_action = gemmaRes.recommendedAction;
+        try {
+          storeDiagnosticEvent({
+            ...diagnosticContract,
+            episode_id: this.activeEpisode ? this.activeEpisode.episode_id : null,
+            location_id: currentLocId
+          });
+        } catch (e) {
+          // ignore duplicate log error
+        }
+      });
+    }
+
+    // 10. Accumulate metrics for episode continuity
+    this.sampleCounts++;
+    this.hrAccumulator.push(this.currentVitals.hr);
+    this.spo2Accumulator.push(this.currentVitals.spo2);
+    this.tempAccumulator.push(this.latestEnv.tempC);
+    this.heatIndexAccumulator.push(heat.heatIndexF);
+    this.accelRmsAccumulator.push(accelRms);
+
+    // 11. 10-Window Debounce Boundary Rule
+    this.classificationHistory.push(activityClass);
+    if (this.classificationHistory.length > 10) {
+      this.classificationHistory.shift();
+    }
+
+    // Check if >= 8 of last 10 belong to a new class
+    const classTally = {};
+    for (const c of this.classificationHistory) {
+      classTally[c] = (classTally[c] || 0) + 1;
+    }
+
+    let dominantNewClass = null;
+    for (const [c, count] of Object.entries(classTally)) {
+      if (count >= 8) {
+        dominantNewClass = c;
+        break;
+      }
+    }
+
+    if (!this.activeEpisode) {
+      this.createEpisode(dominantNewClass || activityClass, confidence, currentLocId);
+    } else {
+      if (dominantNewClass && dominantNewClass !== this.activeEpisode.activity_class) {
+        // Episode boundary transition
+        this.closeEpisode();
+        this.createEpisode(dominantNewClass, confidence, currentLocId);
+      } else {
+        this.extendEpisode();
+      }
+    }
+
+    return {
+      activityClass,
+      activityConfidence: confidence,
+      vitals: this.currentVitals,
+      heatIndex: heat,
+      diagnostic: diagnosticContract,
+      physEval,
+      envEval,
+      accelRms,
+      peakAccelMg: maxAccelMg,
+      activeEpisode: this.activeEpisode
+    };
+  }
+
+  createEpisode(activityClass, confidence, locationId) {
+    this.sampleCounts = 1;
+    this.hrAccumulator = [this.currentVitals.hr];
+    this.spo2Accumulator = [this.currentVitals.spo2];
+    this.tempAccumulator = [this.latestEnv.tempC];
+    this.heatIndexAccumulator = [this.currentHeatIndex.heatIndexF];
+    this.accelRmsAccumulator = [9.8];
+
+    const ep = {
+      start_timestamp: Date.now(),
+      end_timestamp: null,
+      duration_seconds: 0.5,
+      activity_class: activityClass,
+      activity_confidence: confidence,
+      location_id: locationId,
+      hr_mean: this.currentVitals.hr,
+      hr_min: this.currentVitals.hr,
+      hr_max: this.currentVitals.hr,
+      hr_variance: 0.0,
+      hrv_rmssd: this.currentVitals.hrv,
+      spo2_mean: this.currentVitals.spo2,
+      spo2_min: this.currentVitals.spo2,
+      spo2_max: this.currentVitals.spo2,
+      spo2_variance: 0.0,
+      temperature_mean: this.latestEnv.tempC,
+      humidity_mean: this.latestEnv.humPct,
+      pressure_mean: this.latestEnv.pressHpa,
+      heat_index_mean: this.currentHeatIndex.heatIndexF,
+      heat_index_max: this.currentHeatIndex.heatIndexF,
+      accel_rms_mean: 9.8,
+      gyro_rms_mean: 0.0,
+      jerk_mean: 0.0,
+      sma_mean: 9.8
     };
 
     try {
-      // Persist to DB and get back the auto-incremented episode_id
-      const episodeId = saveEpisode(this.activeEpisode);
-      this.activeEpisode.episode_id = episodeId; // Attach DB ID to in-memory object
-      console.log(`[EpisodeEngine] Opened Episode ID ${episodeId} for dominant motion cluster: ${dominantState}`);
-
-      // Record the first timeline entry for this episode's first stride
-      this.saveTimelineEntry(obs);
+      const episodeId = saveEpisode(ep);
+      this.activeEpisode = { ...ep, episode_id: episodeId };
+      console.log(`[EpisodeEngine] Opened Episode ID ${episodeId} for activity: ${activityClass}`);
     } catch (e) {
-      console.warn('[EpisodeEngine] Failed to create new episode:', e);
+      console.warn('[EpisodeEngine] Failed to create episode:', e);
     }
   }
 
-  // Extends the current open episode by one stride (3 seconds).
-  // Updates the motion distribution using an online averaging formula,
-  // increments the duration, and updates familiarity statistics using Welford's algorithm.
-  extendEpisode(obs, familiarityScore) {
+  extendEpisode() {
     if (!this.activeEpisode) return;
+    const duration = (Date.now() - this.activeEpisode.start_timestamp) / 1000.0;
+    this.activeEpisode.duration_seconds = Number(duration.toFixed(1));
 
-    this.timelineLength += 1;
-    const n = this.timelineLength; // Current number of strides (used as denominator)
-
-    // 1. Update the running motion distribution using online averaging:
-    //    P_new[k] = P_old[k] + (P_obs[k] - P_old[k]) / n
-    //    This is the Welford-style running mean for each cluster dimension.
-    const newDistribution = { ...this.activeEpisode.motion_distribution };
-    const allKeys = new Set([
-      ...Object.keys(newDistribution),
-      ...Object.keys(obs.cluster_distribution || {})
-    ]);
-
-    for (const key of allKeys) {
-      const oldVal = newDistribution[key] || 0.0;
-      const newVal = (obs.cluster_distribution && obs.cluster_distribution[key]) || 0.0;
-      newDistribution[key] = oldVal + (newVal - oldVal) / n; // Online mean update
+    // Running means
+    if (this.hrAccumulator.length > 0) {
+      const hrSum = this.hrAccumulator.reduce((a, b) => a + b, 0);
+      this.activeEpisode.hr_mean = Number((hrSum / this.hrAccumulator.length).toFixed(1));
+      this.activeEpisode.hr_min = Math.min(...this.hrAccumulator);
+      this.activeEpisode.hr_max = Math.max(...this.hrAccumulator);
     }
-    this.activeEpisode.motion_distribution = newDistribution;
-
-    // 2. Grow the total duration by one stride (3.0 seconds per stride)
-    this.activeEpisode.duration = n * 3.0;
-
-    // 3. Update running familiarity statistics using Welford's Online Algorithm.
-    //    This avoids accumulating a large sum of squared values (numerical stability).
-    if (familiarityScore !== null) {
-      const x = familiarityScore;
-
-      // Update Min/Max bounds
-      if (this.activeEpisode.familiarity_min === null || x < this.activeEpisode.familiarity_min) {
-        this.activeEpisode.familiarity_min = x;
-      }
-      if (this.activeEpisode.familiarity_max === null || x > this.activeEpisode.familiarity_max) {
-        this.activeEpisode.familiarity_max = x;
-      }
-
-      // Welford's running mean and M2 accumulator:
-      const oldMean = this.activeEpisode.familiarity_mean !== null ? this.activeEpisode.familiarity_mean : 0.0;
-      const newMean = oldMean + (x - oldMean) / n;                    // δ₁ = x - old_mean
-      this.runningFamiliarityM2 = this.runningFamiliarityM2 + (x - oldMean) * (x - newMean); // M2 += δ₁ × δ₂
-
-      this.activeEpisode.familiarity_mean = newMean;
-      this.activeEpisode.familiarity_variance = this.runningFamiliarityM2 / n; // Biased population variance
+    if (this.spo2Accumulator.length > 0) {
+      const spo2Sum = this.spo2Accumulator.reduce((a, b) => a + b, 0);
+      this.activeEpisode.spo2_mean = Number((spo2Sum / this.spo2Accumulator.length).toFixed(1));
+      this.activeEpisode.spo2_min = Math.min(...this.spo2Accumulator);
+      this.activeEpisode.spo2_max = Math.max(...this.spo2Accumulator);
     }
+    if (this.heatIndexAccumulator.length > 0) {
+      this.activeEpisode.heat_index_max = Math.max(...this.heatIndexAccumulator);
+    }
+  }
+
+  closeEpisode() {
+    if (!this.activeEpisode) return;
+    this.activeEpisode.end_timestamp = Date.now();
+    this.extendEpisode();
 
     try {
-      // Persist the updated episode and add this stride's timeline entry
       saveEpisode(this.activeEpisode);
-      this.saveTimelineEntry(obs);
-    } catch (e) {
-      console.warn('[EpisodeEngine] Failed to extend episode:', e);
-    }
-  }
-
-  // Closes the currently open episode by writing its end date/time to the DB.
-  // Called when:
-  //   (a) The dominant motion cluster has changed (a new one will be created next), or
-  //   (b) Manually called on disconnect (via useBle.js or App.js lifecycle)
-  closeEpisode(obs = null) {
-    if (!this.activeEpisode) return;
-
-    // Use the observation's timestamp as the end time if provided, else use now
-    const dateStr = obs ? obs.date : getIsoDateString();
-    const timeStr = obs ? obs.time : getIsoTimeString();
-
-    this.activeEpisode.end_date = dateStr;
-    this.activeEpisode.end_time = timeStr;
-
-    try {
-      saveEpisode(this.activeEpisode); // Persist the closed state to DB
-      console.log(`[EpisodeEngine] Closed Episode ID ${this.activeEpisode.episode_id}. Final duration: ${this.activeEpisode.duration}s`);
+      console.log(`[EpisodeEngine] Closed Episode ID ${this.activeEpisode.episode_id} (${this.activeEpisode.activity_class}, Duration: ${this.activeEpisode.duration_seconds}s)`);
     } catch (e) {
       console.warn('[EpisodeEngine] Failed to close episode:', e);
     }
-
-    // Reset all in-memory state — ready for the next episode
     this.activeEpisode = null;
-    this.timelineLength = 0;
-    this.runningFamiliarityM2 = 0.0;
-  }
-
-  // Appends a single timeline entry to the `episode_motion_timelines` table.
-  // Each timeline entry records one stride (3 seconds) of the current episode.
-  // The reconstruction_mean is the average anomaly MAE across all 10 packets in obs.
-  saveTimelineEntry(obs) {
-    if (!this.activeEpisode) return;
-
-    // Compute the mean reconstruction error across all packets in this observation
-    const recSum = obs.reconstruction_scores.reduce((a, b) => a + b, 0);
-    const recMean = obs.reconstruction_scores.length > 0 ? recSum / obs.reconstruction_scores.length : 0.0;
-
-    const entry = {
-      episode_id: this.activeEpisode.episode_id,
-      window_start_date: obs.date,
-      window_start_time: obs.time,
-      motion_distribution: obs.cluster_distribution,
-      reconstruction_mean: recMean // Average anomaly score for this 5-second window
-    };
-
-    saveEpisodeTimeline(entry);
-  }
-
-  // Returns the cluster ID string with the highest probability in an episode's
-  // averaged motion_distribution. Used to determine whether dominant state changed.
-  getEpisodeDominantState(episode) {
-    if (!episode || !episode.motion_distribution) return '0';
-    let dominantState = '0';
-    let maxProb = -1;
-
-    for (const [clusterId, prob] of Object.entries(episode.motion_distribution)) {
-      if (prob > maxProb) {
-        maxProb = prob;
-        dominantState = clusterId;
-      }
-    }
-    return dominantState;
   }
 }
 
-// Export as a singleton — shared state across the entire app lifecycle.
-// Resets on BLE connect via initialize().
 export const EpisodeEngine = new EpisodeEngineClass();

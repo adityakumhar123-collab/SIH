@@ -1,313 +1,431 @@
+// =============================================================================
+// test_engines.mjs — RakshaBand Offline Multi-Engine Integrity Test Suite
+// =============================================================================
+//
+// Validates:
+// 1. Database Schema & Tables in rakshaband.db (:memory: for testing)
+// 2. FeatureExtraction (Tier 1 stats, Tier 2 DFT, Tier 3 Jacobi, PPG, NOAA Heat Index)
+// 3. MathematicalEngine (NEWS2 cold-start, Mahalanobis distance, EWMA adaptation)
+// 4. DiagnosticReasoningEngine (5 Hypotheses + Fall bypass + Feedback prior penalty)
+// 5. LocationEngine (Dwell centroid, accuracy gating, familiarity)
+// 6. ContextEngine (Threat scoring, off-wrist suppression, emergency threshold)
+// 7. BackgroundServices (Retention policy & baseline recalibration)
+// =============================================================================
+
 import { createRequire } from 'module';
 globalThis.require = createRequire(import.meta.url);
 
-// Set in-memory SQLite database for clean, isolated Node.js testing
+// Isolate test database to in-memory SQLite
 process.env.SAFEBAND_TEST_DB = ':memory:';
 
 import {
   initDatabase,
-  storeObservation,
-  getLatestObservation,
-  getIsoDateString,
-  getIsoTimeString,
-  getLocationNodes
+  saveEpisode,
+  getActiveEpisode,
+  closeActiveEpisode,
+  saveKnownLocation,
+  getKnownLocations,
+  saveLocationVisit,
+  saveBaselineState,
+  getBaselineState,
+  storeDiagnosticEvent,
+  saveUserFeedback,
+  logEscalation,
+  enforceRetentionPolicy,
+  executeSql
 } from './src/Database.js';
-import { LocationEngine } from './src/LocationEngine.js';
-import { MotionEngine } from './src/MotionEngine.js';
-import {
-  ContextEngine,
-  computeThreatScoreDetailed,
-  timeStrToSeconds,
-  secondsToTimeStr
-} from './src/ContextEngine.js';
 
-// Setup utility to log test results with nice formatting
+import {
+  extractWindowFeatures,
+  standardizeFeatures,
+  classifyEmbedding,
+  generateFallbackEmbedding,
+  processPpgWaveform,
+  computeHeatIndex
+} from './src/FeatureExtraction.js';
+
+import { MathematicalEngine } from './src/MathematicalEngine.js';
+import { DiagnosticReasoningEngine, HYPOTHESES } from './src/DiagnosticReasoningEngine.js';
+import { LocationEngine } from './src/LocationEngine.js';
+import { ContextEngine, computeThreatScoreDetailed, getThreatLevel } from './src/ContextEngine.js';
+import { GemmaService } from './src/GemmaService.js';
+import { BackgroundServices } from './src/BackgroundServices.js';
+
 function logResult(name, passed, detail = '') {
   if (passed) {
-    console.log(`\x1b[32m[PASS] ${name}\x1b[0m ${detail}`);
+    console.log(`\x1b[32m[PASS]\x1b[0m ${name} — ${detail}`);
   } else {
-    console.log(`\x1b[31m[FAIL] ${name}\x1b[0m ${detail}`);
+    console.log(`\x1b[31m[FAIL]\x1b[0m ${name} — ${detail}`);
     process.exitCode = 1;
   }
 }
 
-async function runTests() {
-  console.log("==================================================");
-  console.log("SafeBand Engine Integrity Test Suite");
-  console.log("==================================================\n");
+async function runAllTests() {
+  console.log("================================================================");
+  console.log("       RakshaBand Modernization Test & Verification Suite       ");
+  console.log("================================================================\n");
 
-  // 1. Initialise the database schema in memory
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 1: Database Initialization & Tables Validation
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log("--- 1. Database Schema & Tables Verification ---");
   const db = initDatabase();
-  logResult("Database Initialization", db !== null, "In-memory SQLite tables generated successfully.");
+  logResult("Database Initialization", db !== null, "In-memory SQLite created successfully.");
 
-  // Seed mock motion clusters
-  db.execSync(`
-    INSERT INTO motion_clusters (cluster_id, cluster_version, centroid, covariance, visit_count, reconstruction_mean)
-    VALUES 
-      (1, 0, '[0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]', '[]', 10, 0.2),
-      (2, 0, '[-0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5]', '[]', 5, 0.4);
-  `);
-  logResult("Clustering Seed", true, "Centroids loaded into motion_clusters.");
+  const tables = executeSql("SELECT name FROM sqlite_master WHERE type='table';").map(t => t.name);
+  const expectedTables = [
+    'settings', 'emergency_contacts', 'templates', 'known_locations',
+    'location_visits', 'episodes', 'baseline_states', 'diagnostic_events',
+    'user_feedback', 'emergency_escalations'
+  ];
+  const missingTables = expectedTables.filter(t => !tables.includes(t));
+  logResult("Table Schema Integrity", missingTables.length === 0, `Found all 10 tables: ${expectedTables.join(', ')}`);
 
-  // Helper to generate a dummy observation row with specific timestamp, motion clusters and features
-  function buildDummyObservation(date, time, clusterId, features = null, score = 0.15) {
-    const dist = {};
-    dist[clusterId] = 1.0; // 100% of this cluster
+  // Verify default settings seed
+  const settingsRows = executeSql("SELECT key, value FROM settings;");
+  logResult("Settings Seed", settingsRows.length >= 10, `Loaded ${settingsRows.length} default settings.`);
 
-    const twelve = features || [
-      0.15, // std
-      9.8,  // rms (resultant accel)
-      0.0, 0.0,
-      0.05, // zcr
-      1.5,  // dom_freq
-      0.45, // entropy
-      0.1, 0.1,
-      0.8,  // eigenvalueRatio
-      2.5,  // total_variance
-      0.02  // coupling
-    ];
-
-    const motionFeatures = Array.from({ length: 10 }, (_, idx) => ({
-      sequenceId: idx,
-      motionState: 0x82, // Worn & Periodic
-      dominantFreq: twelve[5],
-      zcr: Math.round(twelve[4] * 255.0),
-      spectralEntropy: Math.round(twelve[6] * 255.0),
-      eigenvalueRatio: Math.round(twelve[9] * 1000.0),
-      wearConfidence: 100,
-      peakAccel: Math.round(twelve[1] * 101.97162),
-      anomalyDuration: 0,
-      twelveFeatures: twelve
-    }));
-
-    return {
-      date,
-      time,
-      embeddings: Array(10).fill(Array(16).fill(clusterId === 1 ? 0.1 : -0.5)),
-      reconstruction_scores: Array(10).fill(score),
-      motion_features: motionFeatures,
-      cluster_distribution: dist,
-      cluster_version: 0
-    };
-  }
-
-  // ===========================================================================
-  // TEST 1: Visit-Weighted Location Familiarity Extrapolation
-  // ===========================================================================
-  console.log("\n--- TEST 1: Location Familiarity Extrapolation ---");
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 2: Feature Extraction Pipeline & Mathematical Tiers
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log("\n--- 2. Feature Extraction & Model v3 Pipeline ---");
   
-  // Seed two known location nodes with different visit counts
-  db.execSync(`
-    INSERT INTO location_nodes (location_node_id, center_latitude, center_longitude, radius, visit_count)
-    VALUES 
-      (1, 37.7749, -122.4194, 20.0, 100), -- Home (100 visits)
-      (2, 37.7891, -122.4014, 20.0, 20);   -- Cafe (20 visits)
-  `);
-
-  // Force known nodes to load in LocationEngine
-  LocationEngine.knownNodes = getLocationNodes();
-
-  // Scenario A: Inside Home node radius
-  const famInside = LocationEngine.estimateFamiliarity(37.7749, -122.4194);
-  logResult("Familiarity inside Home geofence", famInside === 1.0, `Score = ${famInside}`);
-
-  // Scenario B: Extrapolated from Home (high visits) vs Cafe (low visits)
-  // Position the user exactly 40 meters from Home node center
-  const d_home = 40.0;
-  // Exp decay = exp(-40 / (20 * 2)) = exp(-1) = 0.367879. Home relative visits = 100/100 = 1.0
-  const famNearHome = LocationEngine.estimateFamiliarity(37.7749 + (40.0 / 111000.0), -122.4194);
-  
-  // Position the user exactly 40 meters from Cafe node center
-  // Cafe relative visits = 20/100 = 0.20. Expected = 0.20 * exp(-1) = 0.07357
-  const famNearCafe = LocationEngine.estimateFamiliarity(37.7891 + (40.0 / 111000.0), -122.4014);
-
-  logResult("Familiarity near Home node (visit-weight 1.0)", famNearHome > 0.33 && famNearHome < 0.40, `Score = ${famNearHome.toFixed(4)}`);
-  logResult("Familiarity near Cafe node (visit-weight 0.2)", famNearCafe > 0.06 && famNearCafe < 0.09, `Score = ${famNearCafe.toFixed(4)}`);
-
-  // ===========================================================================
-  // TEST 2: ContextEngine 3-Window Baseline Comparison & Threat Fusing
-  // ===========================================================================
-  console.log("\n--- TEST 2: Multi-Window Familiarity & Zero-Threat Fallback ---");
-  
-  const targetTime = "12:00:00";
-  const todayStr = "2026-07-16";
-  const yesterdayStr = "2026-07-15";
-  const lastWeekStr = "2026-07-09";
-  const twoWeeksStr = "2026-07-01";
-
-  // Scenario A: Database is empty of history. Ensure zero-threat history fallback works!
-  // Insert only TODAY's observations so we have a current window but zero history
-  const todaySecs = timeStrToSeconds(targetTime);
-  for (let s = todaySecs - 297; s <= todaySecs; s += 3) {
-    const obsData = buildDummyObservation(todayStr, secondsToTimeStr(s), 1);
-    storeObservation(obsData);
-  }
-
-  // Run inference for Case A (No history fallback)
-  const packetNormal = { anomalyScore: 0.2, motionState: 0x02, wearConfidence: 100, dominantFreq: 1.5, eigenvalueRatio: 800, zcr: 12, spectralEntropy: 110, peakAccel: 980, anomalyDuration: 0, motionEmbedding: Array(16).fill(0.1) };
-  
-  // Force LocationEngine current GPS coordinates to match Home
-  LocationEngine.currentGps = { latitude: 37.7749, longitude: -122.4194 };
-
-  const infEmptyHistory = ContextEngine.runInference(packetNormal, null, todayStr, targetTime);
-  logResult("History fallback presence check", ContextEngine.hasHistoryData === false, "Recognized that SQLite history is empty.");
-  logResult("Fallback history scores (S_hist = 0.0)", ContextEngine.cachedHist3s === 0.0 && ContextEngine.cachedHist3m === 0.0 && ContextEngine.cachedHist5m === 0.0, "Forced historical threat scores to exactly 0.0.");
-
-  // Scenario B: Seed historical data matching TODAY's behavior (cluster 1)
-  const historyDates = [yesterdayStr, lastWeekStr, twoWeeksStr];
-  historyDates.forEach(hDate => {
-    const hSecs = timeStrToSeconds(targetTime);
-    for (let s = hSecs - 297; s <= hSecs; s += 3) {
-      const obsData = buildDummyObservation(hDate, secondsToTimeStr(s), 1);
-      storeObservation(obsData);
-    }
+  // Synthesize 200 IMU samples (2 seconds @ 100 Hz): simulated periodic walking
+  const syntheticImuWindow = Array.from({ length: 200 }, (_, i) => {
+    const t = i / 100.0;
+    const ax = 9.80665 * 0.1 * Math.sin(2 * Math.PI * 1.8 * t);
+    const ay = 9.80665 * 0.8; // Gravity on Y
+    const az = 9.80665 * 0.2 * Math.cos(2 * Math.PI * 1.8 * t);
+    const gx = 15.0 * Math.sin(2 * Math.PI * 1.8 * t);
+    const gy = 5.0;
+    const gz = 20.0 * Math.cos(2 * Math.PI * 1.8 * t);
+    return [ax, ay, az, gx, gy, gz];
   });
 
-  // Run inference (now historical data matches current behavior)
-  const infMatchingHistory = ContextEngine.runInference(packetNormal, null, todayStr, targetTime);
-  logResult("Historical baseline comparison match", ContextEngine.hasHistoryData === true, "Recognized that matching history exists in SQLite.");
-  logResult("History scores with matching baseline", ContextEngine.cachedHist3s < 0.2 && ContextEngine.cachedHist3m < 0.2 && ContextEngine.cachedHist5m < 0.2, `Familiarity detected, S_hist ranges: L3s=${ContextEngine.cachedHist3s.toFixed(2)}, L3m=${ContextEngine.cachedHist3m.toFixed(2)}`);
+  const { seqRaw, globRaw } = extractWindowFeatures(syntheticImuWindow);
+  logResult(
+    "Tier 1 & Tier 2 Sequential Features",
+    seqRaw && seqRaw.length === 1320,
+    `Extracted 1320 features across 10 subwindows x (90 statistical + 42 spectral).`
+  );
+  logResult(
+    "Tier 3 Structural Covariance Features",
+    globRaw && globRaw.length === 12,
+    `Extracted 12 structural covariance and Jacobi eigenvalue features.`
+  );
 
-  // Scenario C: Behavioral Deviation
-  // Keep today's current window as cluster 1, but modify history to be cluster 2
-  db.execSync("DELETE FROM observations WHERE date IN ('2026-07-15', '2026-07-09', '2026-07-01');");
-  historyDates.forEach(hDate => {
-    const hSecs = timeStrToSeconds(targetTime);
-    for (let s = hSecs - 297; s <= hSecs; s += 3) {
-      const obsData = buildDummyObservation(hDate, secondsToTimeStr(s), 2); // Cluster 2!
-      storeObservation(obsData);
-    }
+  const { seqNorm, globNorm } = standardizeFeatures(seqRaw, globRaw);
+  logResult(
+    "Feature Standardization",
+    seqNorm.length === 1320 && globNorm.length === 12 && !seqNorm.some(isNaN),
+    "Normalized 1332 features against Model v3 scaling parameters."
+  );
+
+  const embedding32D = generateFallbackEmbedding(seqNorm, globNorm);
+  let mag = Math.sqrt(embedding32D.reduce((s, v) => s + v * v, 0));
+  logResult(
+    "32D Unit-Norm Embedding Generation",
+    embedding32D.length === 32 && Math.abs(mag - 1.0) < 1e-4,
+    `Generated unit-norm 32D embedding (Magnitude: ${mag.toFixed(4)}).`
+  );
+
+  const { activityClass, confidence } = classifyEmbedding(embedding32D);
+  logResult(
+    "21-Class Cosine Classification",
+    typeof activityClass === 'string' && confidence > 0,
+    `Classified activity as: '${activityClass}' (Confidence: ${(confidence * 100).toFixed(1)}%).`
+  );
+
+  // MAX30102 PPG waveform pulse test
+  const syntheticRed = Array.from({ length: 200 }, (_, i) => 25000 + 500 * Math.sin(2 * Math.PI * 1.2 * (i / 100)));
+  const syntheticIr = Array.from({ length: 200 }, (_, i) => 28000 + 1200 * Math.sin(2 * Math.PI * 1.2 * (i / 100)));
+  const ppgResult = processPpgWaveform(syntheticRed, syntheticIr);
+  logResult(
+    "MAX30102 PPG Pulse Extraction",
+    ppgResult.hr > 50 && ppgResult.hr < 120 && ppgResult.spo2 >= 90,
+    `Computed HR: ${ppgResult.hr} BPM, SpO2: ${ppgResult.spo2.toFixed(1)}%, HRV: ${ppgResult.hrv.toFixed(1)} ms.`
+  );
+
+  // NOAA Heat Index Rothfusz test
+  const heatNormal = computeHeatIndex(24.0, 50.0); // 75.2°F, 50% RH -> Normal
+  const heatDanger = computeHeatIndex(35.0, 70.0); // 95°F, 70% RH -> ~123°F (Danger)
+  logResult(
+    "NOAA Heat Index Normal Tier",
+    heatNormal.tier === 'NORMAL' && heatNormal.riskLevel === 0,
+    `24°C / 50% RH -> ${heatNormal.heatIndexF.toFixed(1)}°F (${heatNormal.tier})`
+  );
+  logResult(
+    "NOAA Heat Index Danger Tier",
+    heatDanger.tier === 'DANGER' && heatDanger.riskLevel === 3,
+    `35°C / 70% RH -> ${heatDanger.heatIndexF.toFixed(1)}°F (${heatDanger.tier})`
+  );
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 3: Mathematical Engine (Mahalanobis Distance & NEWS2 Baseline)
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log("\n--- 3. Mathematical Engine (Mahalanobis & NEWS2 Baselines) ---");
+  MathematicalEngine.initialize();
+
+  // Test normal resting vitals
+  const evalNormalVitals = MathematicalEngine.evaluateDomain('physiology', [72, 98]);
+  logResult(
+    "Normal Vitals Inlier Check",
+    !evalNormalVitals.isOutlier && evalNormalVitals.distance < 2.5,
+    `HR=72, SpO2=98 -> DM=${evalNormalVitals.distance.toFixed(3)} (Inlier)`
+  );
+
+  // Test severe deviation (HR=130, SpO2=88)
+  const evalHypoxiaVitals = MathematicalEngine.evaluateDomain('physiology', [130, 88]);
+  const zScoreStr = Object.entries(evalHypoxiaVitals.zScores).map(([k, v]) => `${k}:${v}`).join(', ');
+  logResult(
+    "Hypoxia & Tachycardia Outlier Check",
+    evalHypoxiaVitals.isOutlier && evalHypoxiaVitals.distance > 3.0,
+    `HR=130, SpO2=88 -> DM=${evalHypoxiaVitals.distance.toFixed(3)}, Z-scores=[${zScoreStr}] (Outlier)`
+  );
+
+  // Progressive EWMA update test
+  const baseBefore = MathematicalEngine.getBaseline('physiology', 'global');
+  const initialMeanHR = baseBefore.mean_vector[0];
+  MathematicalEngine.updateBaselineEWMA('physiology', [75, 98], 'global', false);
+  const baseAfter = MathematicalEngine.getBaseline('physiology', 'global');
+  const updatedMeanHR = baseAfter.mean_vector[0];
+  logResult(
+    "Progressive EWMA Update",
+    updatedMeanHR !== initialMeanHR && Math.abs(updatedMeanHR - initialMeanHR) < 1.0,
+    `Initial mean HR: ${initialMeanHR.toFixed(2)} -> Updated mean HR: ${updatedMeanHR.toFixed(2)} (Smooth adaptation)`
+  );
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 4: Diagnostic Reasoning Engine (5 Target Hypotheses & Fall Bypass)
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log("\n--- 4. Diagnostic Reasoning Engine Hypotheses ---");
+
+  // Scenario A: Exertion Benign (High HR, running, normal SpO2, mild environment)
+  const diagExertion = DiagnosticReasoningEngine.evaluate({
+    physEval: { isOutlier: true, distance: 3.2, zScores: [2.8, -0.2] },
+    envEval: { isOutlier: false, distance: 0.5, zScores: [0.1, 0.2, 0.0] },
+    heatIndex: { tier: 'NORMAL', riskLevel: 0 },
+    activityClass: 'running',
+    activityConfidence: 0.95,
+    hr: 145,
+    spo2: 97,
+    persistenceMinutes: 2
+  });
+  logResult(
+    "Hypothesis: EXERTION_BENIGN",
+    diagExertion.primary_hypothesis === HYPOTHESES.EXERTION_BENIGN && diagExertion.severity_tier === 'informational',
+    `Classified as '${diagExertion.primary_hypothesis}' (Confidence: ${(diagExertion.confidence * 100).toFixed(0)}%). Suggested action: ${diagExertion.suggested_action_category}`
+  );
+
+  // Scenario B: Heat Stress / Dehydration (High heat index, elevated temp, resting)
+  const diagHeatStress = DiagnosticReasoningEngine.evaluate({
+    physEval: { isOutlier: true, distance: 2.9, zScores: [2.1, -0.5] },
+    envEval: { isOutlier: true, distance: 3.5, zScores: [3.2, 2.8, -0.1] },
+    heatIndex: { tier: 'DANGER', riskLevel: 3 },
+    activityClass: 'standing',
+    activityConfidence: 0.90,
+    hr: 110,
+    spo2: 96,
+    persistenceMinutes: 10
+  });
+  logResult(
+    "Hypothesis: HEAT_STRESS_DEHYDRATION",
+    diagHeatStress.primary_hypothesis === HYPOTHESES.HEAT_STRESS_DEHYDRATION && (diagHeatStress.severity_tier === 'urgent' || diagHeatStress.severity_tier === 'advisory'),
+    `Classified as '${diagHeatStress.primary_hypothesis}' (Confidence: ${(diagHeatStress.confidence * 100).toFixed(0)}%). Suggested action: ${diagHeatStress.suggested_action_category}`
+  );
+
+  // Scenario C: Respiratory Concern (Hypoxemia SpO2 <= 90%, sitting)
+  const diagRespiratory = DiagnosticReasoningEngine.evaluate({
+    physEval: { isOutlier: true, distance: 4.1, zScores: [1.8, -3.8] },
+    envEval: { isOutlier: false, distance: 0.8, zScores: [0.2, 0.1, 0.0] },
+    heatIndex: { tier: 'NORMAL', riskLevel: 0 },
+    activityClass: 'sitting',
+    activityConfidence: 0.92,
+    hr: 95,
+    spo2: 88,
+    persistenceMinutes: 3
+  });
+  logResult(
+    "Hypothesis: RESPIRATORY_CONCERN",
+    diagRespiratory.primary_hypothesis === HYPOTHESES.RESPIRATORY_CONCERN && (diagRespiratory.severity_tier === 'urgent' || diagRespiratory.severity_tier === 'advisory'),
+    `Classified as '${diagRespiratory.primary_hypothesis}' (Severity: ${diagRespiratory.severity_tier}). Suggested action: ${diagRespiratory.suggested_action_category}`
+  );
+
+  // Scenario D: Cardiovascular Concern (Tachycardia HR=135 resting, SpO2=96)
+  const diagCardio = DiagnosticReasoningEngine.evaluate({
+    physEval: { isOutlier: true, distance: 3.8, zScores: [3.4, -0.2] },
+    envEval: { isOutlier: false, distance: 0.5, zScores: [0.1, 0.1, 0.0] },
+    heatIndex: { tier: 'NORMAL', riskLevel: 0 },
+    activityClass: 'sitting',
+    activityConfidence: 0.88,
+    hr: 135,
+    spo2: 96,
+    persistenceMinutes: 5
+  });
+  logResult(
+    "Hypothesis: CARDIOVASCULAR_CONCERN",
+    diagCardio.primary_hypothesis === HYPOTHESES.CARDIOVASCULAR_CONCERN,
+    `Classified as '${diagCardio.primary_hypothesis}' (Confidence: ${(diagCardio.confidence * 100).toFixed(0)}%).`
+  );
+
+  // Scenario E: Direct Fall / Hard Impact Bypass (>3.5g peak + linear eigenvalue ratio >= 0.70)
+  const diagFall = DiagnosticReasoningEngine.evaluate({
+    physEval: { isOutlier: false, distance: 1.0, zScores: [0.2, 0.1] },
+    envEval: { isOutlier: false, distance: 0.5, zScores: [0.0, 0.0, 0.0] },
+    heatIndex: { tier: 'NORMAL', riskLevel: 0 },
+    activityClass: 'fall',
+    activityConfidence: 0.98,
+    peakAccelMg: 4200, // 4.2g
+    eigenvalueRatio: 0.78, // High directional impact
+    hr: 85,
+    spo2: 98,
+    persistenceMinutes: 0
+  });
+  logResult(
+    "Fall / Impact Direct Escalation Bypass",
+    diagFall.primary_hypothesis === HYPOTHESES.FALL_HARD_IMPACT && diagFall.is_direct_escalation === true,
+    `Triggered direct emergency escalation: '${diagFall.primary_hypothesis}' (Peak Accel: 4200 mg, Severity: ${diagFall.severity_tier})`
+  );
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 5: Location Engine Dwell & Familiarity
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log("\n--- 5. Location Engine (Centroid Dwell & Accuracy Gating) ---");
+  LocationEngine.initialize();
+
+  // Test accuracy gating (> 30m rejected)
+  LocationEngine.onLocationUpdate({ latitude: 12.9716, longitude: 77.5946, accuracy: 45 });
+  logResult("GPS Accuracy Gating", LocationEngine.currentGps === null, "Ignored inaccurate GPS sample (accuracy: 45m > 30m).");
+
+  // Feed high-accuracy GPS samples
+  LocationEngine.onLocationUpdate({ latitude: 12.9716, longitude: 77.5946, accuracy: 12 });
+  logResult("Valid GPS Ingestion", LocationEngine.currentGps !== null, "Accepted GPS fix (lat: 12.9716, lon: 77.5946, acc: 12m).");
+
+  // Familiarity estimation
+  const familiarity = LocationEngine.estimateFamiliarity(12.9716, 77.5946);
+  logResult("Location Familiarity Score", familiarity >= 0.0 && familiarity <= 1.0, `Computed familiarity score: ${(familiarity * 100).toFixed(1)}%.`);
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 6: Context Engine Threat Scoring & Off-Wrist Safety
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log("\n--- 6. Context Engine Threat Scoring & Emergency Thresholds ---");
+  ContextEngine.initialize();
+
+  // Off-wrist suppression test
+  const offWristAssessment = computeThreatScoreDetailed({
+    anomalyScore: 0.95,
+    wearConfidence: 20
+  });
+  logResult(
+    "Off-Wrist Alert Suppression",
+    offWristAssessment.threatScore === 0.0 && offWristAssessment.threatLevel.name === 'NORMAL',
+    "Suppressed threat score to 0.0 because watch is off-wrist (wear confidence: 20% < 40%)."
+  );
+
+  // Fall threat test
+  const fallAssessment = computeThreatScoreDetailed({
+    diagnostic: diagFall,
+    wearConfidence: 100
+  });
+  logResult(
+    "Fall Emergency Escalation Scoring",
+    fallAssessment.threatScore >= 0.72 && fallAssessment.threatLevel.name === 'CRITICAL',
+    `Fall threat score: ${fallAssessment.threatScore} -> Level: ${fallAssessment.threatLevel.name} (Threshold: >=0.72)`
+  );
+
+  // Exertion dampening test
+  const exertionAssessment = computeThreatScoreDetailed({
+    diagnostic: diagExertion,
+    wearConfidence: 100
+  }, { familiarityScore: 0.9 });
+  logResult(
+    "Benign Workout Threat Dampening",
+    exertionAssessment.threatScore < 0.35 && exertionAssessment.threatLevel.name === 'NORMAL',
+    `Healthy workout dampened threat score: ${exertionAssessment.threatScore} (Dampened from high HR during run).`
+  );
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 7: Local On-Device Gemma 3n AI Guidance (Privacy-First)
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log("\n--- 7. Local Gemma 3n On-Device AI Guidance (Privacy-First) ---");
+
+  const gemmaResHeat = await GemmaService.generateGuidance(diagHeatStress, 'Priya');
+  logResult(
+    "Local On-Device Generation (Heat Stress)",
+    gemmaResHeat.isLocal === true && gemmaResHeat.userMessage.includes('Priya'),
+    `Generated: "${gemmaResHeat.userMessage}" [Action: ${gemmaResHeat.recommendedAction}]`
+  );
+
+  const gemmaResFall = await GemmaService.generateGuidance(diagFall, 'Priya');
+  logResult(
+    "Local On-Device Generation (Fall Impact)",
+    gemmaResFall.isLocal === true && gemmaResFall.tone === 'emergency',
+    `Generated: "${gemmaResFall.userMessage}" [Tone: ${gemmaResFall.tone}]`
+  );
+
+  const gemmaPrompt = GemmaService.buildGemmaPrompt(diagHeatStress, 'Priya');
+  logResult(
+    "Gemma 3 Instruction Chat Template Formatting",
+    gemmaPrompt.includes('<start_of_turn>user') && gemmaPrompt.includes('<end_of_turn>') && gemmaPrompt.includes('<start_of_turn>model'),
+    "Adheres to official Gemma 3 conversational turn tokenization."
+  );
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 8: Background Maintenance Services & Retention Policy
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log("\n--- 8. Background Services & Retention Policy ---");
+
+  // Save an old episode (35 days ago)
+  const oldTimestamp = Date.now() - 35 * 24 * 60 * 60 * 1000;
+  saveEpisode({
+    start_timestamp: oldTimestamp,
+    duration_seconds: 60,
+    activity_class: 'sitting',
+    activity_confidence: 1.0,
+    hr_mean: 70
   });
 
-  const infBehavioralDeviation = ContextEngine.runInference(packetNormal, null, todayStr, targetTime);
-  logResult("Behavioral Deviation Detection", ContextEngine.cachedHist3s > 0.50 && ContextEngine.cachedHist3m > 0.50, `Identified cluster change from 1 -> 2. S_hist scores: L3s=${ContextEngine.cachedHist3s.toFixed(3)}, L3m=${ContextEngine.cachedHist3m.toFixed(3)}`);
-
-  // ===========================================================================
-  // TEST 3: Real-Time 2 Hz Threat Score Calculations
-  // ===========================================================================
-  console.log("\n--- TEST 3: 2 Hz Real-Time Threat Score Pipeline ---");
-
-  // Scenario A: Normal behavior
-  // Reset database observations first so we have a clean slate for normal behavior
-  db.execSync("DELETE FROM observations;");
-  // Seed normal observations for today
-  for (let s = todaySecs - 297; s <= todaySecs; s += 3) {
-    storeObservation(buildDummyObservation(todayStr, secondsToTimeStr(s), 1));
-  }
-  // Run inference to cache normal baseline scores
-  const packetNormal2Hz = {
-    sequenceId: 10,
-    anomalyScore: 0.15,
-    motionState: 0x02,
-    peakAccel: 980,
-    dominantFreq: 1.5,
-    zcr: 12,
-    spectralEntropy: 110,
-    eigenvalueRatio: 800,
-    wearConfidence: 100,
-    motionEmbedding: Array(16).fill(0.1)
-  };
-  ContextEngine.runInference(packetNormal2Hz, null, todayStr, targetTime);
-
-  // Set buffer
-  MotionEngine.buffer = Array.from({ length: 10 }, (_, idx) => ({
-    sequenceId: idx,
-    anomalyScore: 0.2,
-    motionState: 0x02,
-    peakAccel: 980,
-    dominantFreq: 1.5,
-    zcr: 12,
-    spectralEntropy: 110,
-    eigenvalueRatio: 800,
-    wearConfidence: 100,
-    motionEmbedding: Array(16).fill(0.1)
-  }));
-
-  const scoreNormal = computeThreatScoreDetailed(packetNormal2Hz);
-  logResult("Normal threat score", scoreNormal.score < 0.25, `Fused threat = ${Math.round(scoreNormal.score * 100)}%`);
-
-  // Scenario B: High Threat Anomaly Trigger (Fall Candidate with Behavioral Deviation)
-  // Set location to totally unfamiliar
-  LocationEngine.currentGps = { latitude: 0, longitude: 0 };
-
-  // Clear database observations first
-  db.execSync("DELETE FROM observations;");
-
-  // Seed today's observations with high-impact, high-anomaly, varying features (to create volatility/drift)
-  for (let s = todaySecs - 297; s <= todaySecs; s += 3) {
-    const factor = (s - (todaySecs - 297)) / 300; // 0 to 1
-    const valStd = 0.8 + factor * 0.4;
-    const valRms = 22.0 + Math.sin(factor * 10) * 8.0;
-    const valZcr = 0.15 + factor * 0.1;
-    const valEntropy = 0.3 + factor * 0.2;
-    const valVar = 6.0 + factor * 5.0;
-
-    storeObservation(buildDummyObservation(todayStr, secondsToTimeStr(s), 1, [
-      valStd, // std
-      valRms, // rms
-      0.5, 0.5, // skew, kurt
-      valZcr, // zcr
-      2.5, // dom_freq
-      valEntropy, // entropy
-      0.1, 0.1,
-      0.95, // eigenvalueRatio
-      valVar, // total_variance
-      0.02 // coupling
-    ], 1.10));
-  }
-
-  // Seed historical observations on D-1, D-7, D-15 with completely different behavior (cluster 2, normal features)
-  historyDates.forEach(hDate => {
-    const hSecs = timeStrToSeconds(targetTime);
-    for (let s = hSecs - 297; s <= hSecs; s += 3) {
-      storeObservation(buildDummyObservation(hDate, secondsToTimeStr(s), 2)); // Cluster 2!
-    }
+  // Save a recent episode (1 hour ago)
+  const recentTimestamp = Date.now() - 3600 * 1000;
+  saveEpisode({
+    start_timestamp: recentTimestamp,
+    duration_seconds: 120,
+    activity_class: 'walking',
+    activity_confidence: 0.95,
+    hr_mean: 85
   });
 
-  // Setup MotionEngine.buffer with high-impact, high-anomaly, varying features
-  MotionEngine.buffer = Array.from({ length: 10 }, (_, idx) => ({
-    sequenceId: idx,
-    anomalyScore: 1.10 + idx * 0.01,
-    motionState: 0x8A, // Worn, Periodic & High-Impact
-    peakAccel: Math.round((22.0 + Math.sin(idx) * 8.0) * 101.97162),
-    dominantFreq: 2.5,
-    zcr: Math.round((0.15 + idx * 0.01) * 255.0),
-    spectralEntropy: Math.round((0.3 + idx * 0.02) * 255.0),
-    eigenvalueRatio: 950,
-    wearConfidence: 100,
-    motionEmbedding: Array(16).fill(0.1 + idx * 0.05) // varying embeddings for drift
-  }));
+  const cleanupStats = BackgroundServices.runDatabaseCleanup(30);
+  logResult(
+    "Database 30-Day Retention Policy",
+    cleanupStats !== null && cleanupStats.deletedEpisodes >= 1,
+    `Purged ${cleanupStats.deletedEpisodes} expired episodes older than 30 days.`
+  );
 
-  const packetAnomaly2Hz = {
-    sequenceId: 10,
-    anomalyScore: 1.19,
-    motionState: 0x8A,
-    peakAccel: 3000,
-    dominantFreq: 2.5,
-    zcr: 50,
-    spectralEntropy: 85,
-    eigenvalueRatio: 960,
-    wearConfidence: 100,
-    motionEmbedding: Array(16).fill(0.6)
-  };
+  // Recalibrate baselines across locations
+  saveKnownLocation({
+    latitude: 12.9716,
+    longitude: 77.5946,
+    label: 'Home',
+    radius_meters: 50
+  });
+  const recalibReport = BackgroundServices.recalibrateBaselines();
+  logResult(
+    "Baseline Recalibration Service",
+    recalibReport.success === true && recalibReport.locationsChecked >= 1,
+    `Recalibrated baselines across ${recalibReport.locationsChecked} registered location nodes.`
+  );
 
-  // Run inference to update caches with high threat scores
-  ContextEngine.runInference(packetAnomaly2Hz, null, todayStr, targetTime);
-
-  const scoreAnomaly = computeThreatScoreDetailed(packetAnomaly2Hz);
-  logResult("High threat fall score", scoreAnomaly.score > 0.70, `Fused threat = ${Math.round(scoreAnomaly.score * 100)}% (3s: ${Math.round(scoreAnomaly.score3s * 100)}%, 3m: ${Math.round(scoreAnomaly.score3m * 100)}%, 5m: ${Math.round(scoreAnomaly.score5m * 100)}%)`);
-
-  // Scenario C: Wear Confidence suppression
-  const packetUnworn = { ...packetAnomaly2Hz, wearConfidence: 30 }; // Less than 40%
-  const scoreUnworn = computeThreatScoreDetailed(packetUnworn);
-  logResult("Unworn threat score suppression", scoreUnworn.score === 0.0 && scoreUnworn.score3s === 0.0, `Suppressed threat = ${scoreUnworn.score}`);
-
-  console.log("\n==================================================");
-  console.log("All tests completed.");
-  console.log("==================================================");
+  console.log("\n================================================================");
+  if (process.exitCode === 1) {
+    console.log("❌ Some tests failed. Please inspect logs above.");
+  } else {
+    console.log("✅ ALL RAKSHABAND INTEGRITY TESTS PASSED SUCCESSFULLY!");
+  }
+  console.log("================================================================\n");
 }
 
-runTests().catch(err => {
-  console.error("Test execution failed:", err);
+runAllTests().catch(err => {
+  console.error("Test Suite Execution Failed:", err);
   process.exit(1);
 });

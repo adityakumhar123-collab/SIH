@@ -76,7 +76,6 @@ import {
   base64ToUint8Array,      // Converts BLE characteristic value (Base64) → Uint8Array
   encodeSingleByteBase64,  // Encodes a command byte → Base64 for BLE write
 } from '../BleService';
-import { MotionEngine } from '../MotionEngine.js';
 import { EpisodeEngine } from '../EpisodeEngine.js';
 import { LocationEngine } from '../LocationEngine.js';
 
@@ -167,15 +166,20 @@ export default function useBle(activeTab, addLog) {
   // component that reads this will re-render when it changes.
   // DashboardTab.js reads this to update all the gauges and the PCA plot.
   const [currentPacket, setCurrentPacket] = useState({
-    anomalyScore: 0.1060,   // Float MAE reconstruction error (dequantized)
-    anomalyDuration: 0,     // ×100ms counter of sustained anomaly
-    motionState: 0,         // Bitmask: bit0=Still, bit1=Periodic, bit2=Aperiodic, etc.
-    peakAccel: 1020,        // mg — peak acceleration in the last window
-    dominantFreq: 1.0,      // Hz — dominant frequency in the last window
-    eigenvalueRatio: 500,   // 0–1000 — linear vs. multidirectional (>700 = fall-like)
-    zcr: 30,                // Zero-crossing rate
-    spectralEntropy: 60,    // Spectral entropy (0–255)
-    motionEmbedding: new Array(16).fill(0), // 16D dequantized float embedding
+    activityClass: 'standing',
+    activityConfidence: 1.0,
+    hr: 72,
+    spo2: 98.0,
+    hrv: 45.0,
+    tempC: 24.0,
+    heatIndexF: 75.0,
+    heatIndexTier: 'NORMAL',
+    diagnostic: null,
+    anomalyScore: 0.1060,
+    peakAccel: 1000,
+    wearConfidence: 100,
+    motionState: 1,
+    motionEmbedding: new Array(32).fill(0),
   });
 
   // --- Refs ---
@@ -243,162 +247,76 @@ export default function useBle(activeTab, addLog) {
   //   STATUS        → battery/wear state → UI logs
   // =============================================================================
   const handleIncomingPacket = (parsed) => {
-    // --- FEATURE and EVENT packets → Analytics pipeline ---
-    // Both types carry embeddings and are fed to the MotionEngine for observation building
-    if (parsed.type === 'FEATURE' || parsed.type === 'EVENT') {
-      try {
-        // MotionEngine accumulates packets into its 10-packet buffer.
-        // Returns an Observation every 6th packet (every 3s), or null otherwise.
-        const obs = MotionEngine.onBLEPacket(parsed);
-        if (obs) {
-          addLog(`📦 Motion Engine produced Observation #${obs.observation_id} | Distribution: ${JSON.stringify(obs.cluster_distribution)}`, 'CONTEXT');
-          
-          // Estimate familiarity from GPS if available
-          let familiarity = 0.5; // Default: neutral (no GPS = no advantage)
-          if (LocationEngine.currentGps) {
-            familiarity = LocationEngine.estimateFamiliarity(
-              LocationEngine.currentGps.latitude,
-              LocationEngine.currentGps.longitude
-            );
-          }
-          
-          // Forward observation to EpisodeEngine for session continuity tracking
-          const ep = EpisodeEngine.updateEpisode(obs, familiarity);
-          if (ep) {
-            addLog(`🎬 Episode Engine updated Episode #${ep.episode_id} | Duration: ${ep.duration}s | Dominant State: ${EpisodeEngine.getEpisodeDominantState(ep)}`, 'CONTEXT');
-          }
-        }
-      } catch (err) {
-        console.warn('[BLE] MotionEngine packet processing failed:', err);
-      }
-    }
+    if (!parsed) return;
 
-    // --- SENSOR packets → Live IMU waveform graph ---
-    if (parsed.type === 'SENSOR') {
-      // Only update the graph if streaming is active AND the user is on the dashboard tab.
-      // Throttle to max 5 updates/sec (200ms) to avoid flooding React with re-renders.
+    if (parsed.type === 'MOTION') {
+      EpisodeEngine.pushMotionSample([parsed.ax, parsed.ay, parsed.az, parsed.gx, parsed.gy, parsed.gz]);
+
+      // Throttle graph waveform updates to 5 Hz (every 200ms)
       if (isStreaming && activeTabRef.current === 'DASHBOARD') {
         const now = Date.now();
         if (now - lastGraphUpdateRef.current > 200) {
           lastGraphUpdateRef.current = now;
           setStreamData((prevData) => {
-            const newData = [...prevData, parsed];
-            if (newData.length > 50) newData.shift(); // Keep at most 50 frames (ring buffer)
+            const frame = {
+              ax: parsed.rawMg ? parsed.rawMg[0] : Math.round(parsed.ax * 101.97),
+              ay: parsed.rawMg ? parsed.rawMg[1] : Math.round(parsed.ay * 101.97),
+              az: parsed.rawMg ? parsed.rawMg[2] : Math.round(parsed.az * 101.97),
+              resultant: Math.round(parsed.resultantMps2 * 101.97)
+            };
+            const newData = [...prevData, frame];
+            if (newData.length > 50) newData.shift();
             return newData;
           });
         }
       }
-      // Raw sensor stream logging is disabled to avoid flooding the log panel.
-      // The graph on the dashboard provides real-time visual telemetry.
-    } else if (parsed.type === 'FEATURE') {
-      // --- FEATURE packets → Update currentPacket (dashboard gauges + PCA plot) ---
-      setCurrentPacket((prev) => {
-        // Only trigger a React re-render if at least one field has actually changed.
-        // This prevents unnecessary renders at 2 Hz even when device is still.
-        const hasChanged =
-          (parsed.anomalyScore !== undefined && parsed.anomalyScore !== prev.anomalyScore) ||
-          (parsed.anomalyDuration !== undefined && parsed.anomalyDuration !== prev.anomalyDuration) ||
-          (parsed.motionState !== undefined && parsed.motionState !== prev.motionState) ||
-          (parsed.peakAccel !== undefined && parsed.peakAccel !== prev.peakAccel) ||
-          (parsed.dominantFreq !== undefined && parsed.dominantFreq !== prev.dominantFreq) ||
-          (parsed.eigenvalueRatio !== undefined && parsed.eigenvalueRatio !== prev.eigenvalueRatio) ||
-          (parsed.zcr !== undefined && parsed.zcr !== prev.zcr) ||
-          (parsed.spectralEntropy !== undefined && parsed.spectralEntropy !== prev.spectralEntropy) ||
-          (parsed.wearConfidence !== undefined && parsed.wearConfidence !== prev.wearConfidence) ||
-          (parsed.isThreat !== undefined && parsed.isThreat !== prev.isThreat) ||
-          // Deep compare the 16D embedding using JSON stringify (fast for small arrays)
-          (parsed.motionEmbedding !== undefined && JSON.stringify(parsed.motionEmbedding) !== JSON.stringify(prev.motionEmbedding));
 
-        if (!hasChanged) return prev; // Return previous state to skip re-render
+      // Process 200-sample window if accumulated (every 50 samples = 2 Hz)
+      try {
+        const windowResult = EpisodeEngine.processWindow();
+        if (windowResult) {
+          setCurrentPacket((prev) => ({
+            ...prev,
+            activityClass: windowResult.activityClass,
+            activityConfidence: windowResult.activityConfidence,
+            hr: windowResult.vitals.hr,
+            spo2: windowResult.vitals.spo2,
+            hrv: windowResult.vitals.hrv,
+            tempC: EpisodeEngine.latestEnv.tempC,
+            heatIndexF: windowResult.heatIndex.heatIndexF,
+            heatIndexTier: windowResult.heatIndex.tier,
+            diagnostic: windowResult.diagnostic,
+            anomalyScore: windowResult.physEval ? Number((windowResult.physEval.distance / 4.0).toFixed(3)) : 0.1,
+            peakAccel: Math.round(windowResult.peakAccelMg),
+            wearConfidence: 100
+          }));
 
-        // Merge only the changed fields into the previous state
-        return {
-          ...prev,
-          sequenceId: parsed.sequenceId !== undefined ? parsed.sequenceId : prev.sequenceId,
-          anomalyScore: parsed.anomalyScore !== undefined ? parsed.anomalyScore : prev.anomalyScore,
-          anomalyDuration: parsed.anomalyDuration !== undefined ? parsed.anomalyDuration : prev.anomalyDuration,
-          motionState: parsed.motionState !== undefined ? parsed.motionState : prev.motionState,
-          peakAccel: parsed.peakAccel !== undefined ? parsed.peakAccel : prev.peakAccel,
-          dominantFreq: parsed.dominantFreq !== undefined ? parsed.dominantFreq : prev.dominantFreq,
-          eigenvalueRatio: parsed.eigenvalueRatio !== undefined ? parsed.eigenvalueRatio : prev.eigenvalueRatio,
-          zcr: parsed.zcr !== undefined ? parsed.zcr : prev.zcr,
-          spectralEntropy: parsed.spectralEntropy !== undefined ? parsed.spectralEntropy : prev.spectralEntropy,
-          wearConfidence: parsed.wearConfidence !== undefined ? parsed.wearConfidence : prev.wearConfidence,
-          motionEmbedding: parsed.motionEmbedding !== undefined ? parsed.motionEmbedding : prev.motionEmbedding,
-          isThreat: parsed.isThreat !== undefined ? parsed.isThreat : prev.isThreat,
-          twelveFeatures: parsed.twelveFeatures !== undefined ? parsed.twelveFeatures : prev.twelveFeatures,
-        };
-      });
-
-      // Update top-level wear confidence state for the status indicator
-      if (parsed.wearConfidence !== undefined) setWearConfidence(parsed.wearConfidence);
-
-      // Decode motionState bitmask to human-readable names for log output
-      const motionNames = [];
-      if (parsed.motionState & (1 << 0)) motionNames.push('STILL');
-      if (parsed.motionState & (1 << 1)) motionNames.push('PERIODIC');
-      if (parsed.motionState & (1 << 2)) motionNames.push('APERIODIC');
-      if (parsed.motionState & (1 << 3)) motionNames.push('HIGH-IMPACT');
-      if (parsed.motionState & (1 << 4)) motionNames.push('RESTRAINED');
-
-      // Format the 16D embedding as a readable string with 2 decimal places
-      const embStr = parsed.motionEmbedding ? `[${parsed.motionEmbedding.map(x => x.toFixed(2)).join(', ')}]` : 'N/A';
-
-      // Throttle feature logging: log instantly on anomaly, or periodically every 5 seconds (10 packets at 2 Hz)
-      featureLogCounterRef.current++;
-      if (parsed.anomalyScore > 1.01309 || featureLogCounterRef.current % 10 === 0) {
-        const totalVarianceVal = parsed.twelveFeatures ? parsed.twelveFeatures[10].toFixed(1) : 'N/A';
-        addLog(
-          `TinyML Live Features: Score=${parsed.anomalyScore} | ZCR=${parsed.zcr} Entropy=${parsed.spectralEntropy} | ` +
-          `Motion=0x${parsed.motionState.toString(16).toUpperCase()} (${motionNames.join('+')}) Freq=${parsed.dominantFreq.toFixed(1)}Hz | ` +
-          `Linearity=${parsed.eigenvalueRatio} Peak=${parsed.peakAccel}mg | Wear=${parsed.wearConfidence}% Var=${totalVarianceVal} | Emb=${embStr}`,
-          'TINYML'
-        );
+          if (windowResult.diagnostic && windowResult.diagnostic.primary_hypothesis !== 'ANOMALY_UNCLEAR') {
+            addLog(
+              `🧠 Diagnostic Engine: ${windowResult.diagnostic.primary_hypothesis} (${(windowResult.diagnostic.confidence * 100).toFixed(0)}%) [${windowResult.diagnostic.severity_tier.toUpperCase()}] — Evidence: ${windowResult.diagnostic.contributing_evidence.join('; ')}`,
+              'CONTEXT'
+            );
+          }
+        }
+      } catch (err) {
+        console.warn('[BLE] EpisodeEngine window processing failed:', err);
       }
-    } else if (parsed.type === 'EVENT') {
-      // --- EVENT packets → Update currentPacket (same as FEATURE but with alert context) ---
-      // NOTE: sequenceId is NOT preserved here — see BUG note at top of file.
-      setCurrentPacket((prev) => {
-        const hasChanged =
-          (parsed.anomalyScore !== undefined && parsed.anomalyScore !== prev.anomalyScore) ||
-          (parsed.anomalyDuration !== undefined && parsed.anomalyDuration !== prev.anomalyDuration) ||
-          (parsed.motionState !== undefined && parsed.motionState !== prev.motionState) ||
-          (parsed.peakAccel !== undefined && parsed.peakAccel !== prev.peakAccel) ||
-          (parsed.dominantFreq !== undefined && parsed.dominantFreq !== prev.dominantFreq) ||
-          (parsed.eigenvalueRatio !== undefined && parsed.eigenvalueRatio !== prev.eigenvalueRatio) ||
-          (parsed.zcr !== undefined && parsed.zcr !== prev.zcr) ||
-          (parsed.spectralEntropy !== undefined && parsed.spectralEntropy !== prev.spectralEntropy) ||
-          (parsed.wearConfidence !== undefined && parsed.wearConfidence !== prev.wearConfidence) ||
-          (parsed.motionEmbedding !== undefined && JSON.stringify(parsed.motionEmbedding) !== JSON.stringify(prev.motionEmbedding));
-
-        if (!hasChanged) return prev;
-
-        return {
-          ...prev,
-          anomalyScore: parsed.anomalyScore !== undefined ? parsed.anomalyScore : prev.anomalyScore,
-          anomalyDuration: parsed.anomalyDuration !== undefined ? parsed.anomalyDuration : prev.anomalyDuration,
-          motionState: parsed.motionState !== undefined ? parsed.motionState : prev.motionState,
-          peakAccel: parsed.peakAccel !== undefined ? parsed.peakAccel : prev.peakAccel,
-          dominantFreq: parsed.dominantFreq !== undefined ? parsed.dominantFreq : prev.dominantFreq,
-          eigenvalueRatio: parsed.eigenvalueRatio !== undefined ? parsed.eigenvalueRatio : prev.eigenvalueRatio,
-          zcr: parsed.zcr !== undefined ? parsed.zcr : prev.zcr,
-          spectralEntropy: parsed.spectralEntropy !== undefined ? parsed.spectralEntropy : prev.spectralEntropy,
-          wearConfidence: parsed.wearConfidence !== undefined ? parsed.wearConfidence : prev.wearConfidence,
-          motionEmbedding: parsed.motionEmbedding !== undefined ? parsed.motionEmbedding : prev.motionEmbedding,
-        };
-      });
-      if (parsed.battery !== undefined) setBatteryPct(parsed.battery);
-      if (parsed.wearConfidence !== undefined) setWearConfidence(parsed.wearConfidence);
-
-      const embStr = parsed.motionEmbedding ? `[${parsed.motionEmbedding.join(', ')}]` : 'N/A';
-      addLog(`⚠️ TinyML ALERT RECEIVED: Score=${parsed.anomalyScore} Conf=${parsed.confidence}% Peak=${parsed.peakAccel}mg Dur=${parsed.anomalyDuration}x100ms | Emb=${embStr}`, 'TINYML');
+    } else if (parsed.type === 'VITAL') {
+      EpisodeEngine.pushVitalSample(parsed.red, parsed.ir);
+    } else if (parsed.type === 'ENVIRONMENT') {
+      EpisodeEngine.pushEnvironmentSample(parsed.tempC, parsed.pressureHpa, parsed.humidityPct);
     } else if (parsed.type === 'STATUS') {
-      // --- STATUS packets → Update device health indicators ---
-      if (parsed.battery !== undefined) setBatteryPct(parsed.battery);
-      if (parsed.wearConfidence !== undefined) setWearConfidence(parsed.wearConfidence);
-      if (parsed.uptime !== undefined) setUptime(parsed.uptime);
-
-      addLog(`Heartbeat: Battery=${parsed.battery}% Wear=${parsed.wearConfidence}% Uptime=${parsed.uptime}m AvgAnomaly=${parsed.avgAnomaly} Inference=${parsed.inferenceRate}Hz Flags=0x${(parsed.systemFlags || 0).toString(16).toUpperCase()}`, 'TINYML');
+      if (parsed.batteryPct !== undefined) setBatteryPct(parsed.batteryPct);
+      if (parsed.uptimeMinutes !== undefined) setUptime(parsed.uptimeMinutes);
+      addLog(`Status: Battery=${parsed.batteryPct}%, Uptime=${parsed.uptimeMinutes}m, FW=${parsed.fwVersion}`, 'SYSTEM');
+    } else if (parsed.type === 'LEGACY_FEATURE') {
+      // Compatibility fallback
+      setCurrentPacket((prev) => ({
+        ...prev,
+        anomalyScore: parsed.anomalyScore,
+        peakAccel: parsed.peakAccel,
+        wearConfidence: parsed.wearConfidence
+      }));
     }
   };
 
@@ -534,10 +452,10 @@ export default function useBle(activeTab, addLog) {
       setActiveDevice(discoveredDevice);
       setConnectionState('CONNECTED');
       try {
-        // Reset the MotionEngine buffer and reload cluster centroids from DB
-        MotionEngine.initialize();
+        EpisodeEngine.initialize();
+        LocationEngine.initialize();
       } catch (err) {
-        console.warn('[BLE] Failed to initialize MotionEngine:', err);
+        console.warn('[BLE] Failed to initialize EpisodeEngine/LocationEngine:', err);
       }
       setDevices([]); // Clear the scan list — no longer needed
 

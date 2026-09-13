@@ -217,3 +217,4 @@ The mobile app requires Node.js and Expo.
     npx expo start
     ```
 4.  Run on an emulator or scan the QR code using the **Expo Go** app on your phone (ensure Bluetooth permissions are allowed for BLE connectivity).
+NOTE THE README ABOVE IS FOR OLD LEGACY VERSION OF SAFEBAND , NOW WE ARE MAKING NECESSARY CHANGES IN IT TO ADAPT TO THE NEW PROJECT RAKSHABAND. SO USE IT FOR OLD CONTEXT ONLY , THE NEW THING IS SIGNIFICANLTLY DIFFERENT.

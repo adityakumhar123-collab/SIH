@@ -10,6 +10,7 @@ const SettingsTab = React.memo(({
   twilioBalanceError,
   checkTwilioBalance,
   handleToggleGlobalChannel,
+  handleRecalibrateBaselines,
   handleRunReclustering,
   handleRunCleanup
 }) => {
@@ -208,6 +209,33 @@ const SettingsTab = React.memo(({
         </View>
       </View>
 
+      {/* Privacy & Local On-Device AI */}
+      <View style={[styles.card, { borderColor: 'rgba(16, 185, 129, 0.25)' }]}>
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          <Text style={[styles.cardTitle, { color: '#10B981', marginBottom: 0 }]}>🛡️ Privacy & Local On-Device AI</Text>
+          <View style={{ paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, backgroundColor: 'rgba(16, 185, 129, 0.15)', borderWidth: 1, borderColor: '#10B981' }}>
+            <Text style={{ color: '#10B981', fontSize: 10, fontWeight: 'bold' }}>100% OFFLINE</Text>
+          </View>
+        </View>
+        <Text style={styles.multiplierItem}>
+          RakshaBand operates strictly on-device. Your real-time biometric vitals, GPS visits, and diagnostic hypotheses NEVER leave your phone or touch any cloud server.
+        </Text>
+        <View style={[styles.rowBetween, { paddingVertical: 6, marginTop: 4 }]}>
+          <Text style={{ color: '#F8FAFC', fontSize: 14 }}>Local Gemma 3n Guidance</Text>
+          <Switch
+            value={dbSettings.local_ai_enabled !== '0'}
+            onValueChange={(val) => {
+              const strVal = val ? '1' : '0';
+              saveSetting('local_ai_enabled', strVal);
+              setDbSettings(prev => ({ ...prev, local_ai_enabled: strVal }));
+            }}
+          />
+        </View>
+        <Text style={{ color: '#64748B', fontSize: 11, marginTop: 4 }}>
+          Engine: Gemma 3n (Local On-Device Generative Synthesis)
+        </Text>
+      </View>
+
       {/* Gateway API Credentials settings */}
       <View style={styles.card}>
         <Text style={styles.cardTitle}>🔑 API Credentials & Gateways</Text>
@@ -298,22 +326,22 @@ const SettingsTab = React.memo(({
 
       {/* Background Services Control Panel */}
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Background Services & ML Tasks</Text>
+        <Text style={styles.cardTitle}>Background Services & Maintenance</Text>
         <Text style={styles.multiplierItem}>
-          Trigger background clustering, historical reassignment, and database retention cleanups manually.
+          Manually trigger NEWS2 baseline recalibrations across locations and enforce database retention policies (30 days).
         </Text>
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 12 }}>
           <TouchableOpacity
             style={styles.bleDeviceConnectBtn}
-            onPress={handleRunReclustering}
+            onPress={handleRecalibrateBaselines || handleRunReclustering}
           >
-            <Text style={styles.bleDeviceConnectText}>Run Reclustering</Text>
+            <Text style={styles.bleDeviceConnectText}>Recalibrate Baselines</Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.bleDeviceConnectBtn, { backgroundColor: '#475569' }]}
             onPress={handleRunCleanup}
           >
-            <Text style={styles.bleDeviceConnectText}>Database Cleanup</Text>
+            <Text style={styles.bleDeviceConnectText}>Database Cleanup (30d)</Text>
           </TouchableOpacity>
         </View>
       </View>

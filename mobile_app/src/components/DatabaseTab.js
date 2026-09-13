@@ -11,16 +11,16 @@ const DatabaseTab = React.memo(() => {
   const [expandedRows, setExpandedRows] = useState({});
 
   const TABLES = [
-    { name: 'observations', label: '📊 Observations' },
     { name: 'episodes', label: '🎬 Episodes' },
-    { name: 'inference_logs', label: '🧠 Inference Logs' },
-    { name: 'location_nodes', label: '📍 Loc Nodes' },
-    { name: 'location_visits', label: '🚪 Loc Visits' },
-    { name: 'settings', label: '⚙️ Settings' },
-    { name: 'contacts', label: '👥 Contacts' },
+    { name: 'diagnostic_events', label: '🧠 Diagnostics' },
+    { name: 'known_locations', label: '📍 Locations' },
+    { name: 'location_visits', label: '🚪 Visits' },
+    { name: 'baseline_states', label: '📈 Baselines' },
+    { name: 'user_feedback', label: '💬 Feedback' },
+    { name: 'emergency_escalations', label: '🚨 Escalations' },
+    { name: 'emergency_contacts', label: '👥 Contacts' },
     { name: 'templates', label: '📝 Templates' },
-    { name: 'motion_clusters', label: '🧬 Clusters' },
-    { name: 'episode_motion_timelines', label: '⏳ Timelines' }
+    { name: 'settings', label: '⚙️ Settings' }
   ];
 
   const fetchTableData = (tableName) => {
@@ -29,18 +29,17 @@ const DatabaseTab = React.memo(() => {
     setExpandedRows({});
     try {
       let pkCol = 'rowid';
-      if (tableName === 'observations') pkCol = 'observation_id';
-      else if (tableName === 'episodes') pkCol = 'episode_id';
-      else if (tableName === 'inference_logs') pkCol = 'inference_id';
+      if (tableName === 'episodes') pkCol = 'episode_id';
+      else if (tableName === 'diagnostic_events') pkCol = 'event_id';
+      else if (tableName === 'known_locations') pkCol = 'location_id';
       else if (tableName === 'location_visits') pkCol = 'visit_id';
-      else if (tableName === 'location_nodes') pkCol = 'location_node_id';
-      else if (tableName === 'contacts') pkCol = 'id';
+      else if (tableName === 'user_feedback') pkCol = 'feedback_id';
+      else if (tableName === 'emergency_escalations') pkCol = 'escalation_id';
+      else if (tableName === 'emergency_contacts') pkCol = 'id';
       else if (tableName === 'templates') pkCol = 'id';
-      else if (tableName === 'motion_clusters') pkCol = 'cluster_id';
-      else if (tableName === 'episode_motion_timelines') pkCol = 'timeline_id';
       else if (tableName === 'settings') pkCol = 'key';
 
-      const sql = tableName === 'settings'
+      const sql = (tableName === 'settings' || tableName === 'baseline_states')
         ? `SELECT * FROM ${tableName} LIMIT 50;`
         : `SELECT * FROM ${tableName} ORDER BY ${pkCol} DESC LIMIT 50;`;
       
@@ -93,26 +92,26 @@ const DatabaseTab = React.memo(() => {
     
     // Get a brief identifier for the row summary header
     let summaryText = `Row #${index + 1}`;
-    if (selectedTable === 'observations') {
-      summaryText = `Obs #${row.observation_id} | ${row.date} ${row.time}`;
-    } else if (selectedTable === 'episodes') {
-      summaryText = `Ep #${row.episode_id} | ${row.start_date} ${row.start_time} (${row.duration || 0}s)`;
-    } else if (selectedTable === 'inference_logs') {
-      summaryText = `Inference #${row.inference_id} | Threat: ${Math.round((row.emergency_score || 0) * 100)}% | Anomaly: ${row.anomaly_score}`;
-    } else if (selectedTable === 'location_nodes') {
-      summaryText = `Node #${row.location_node_id} | R=${row.radius}m | Visits=${row.visit_count}`;
+    if (selectedTable === 'episodes') {
+      summaryText = `Ep #${row.episode_id} | ${row.activity_class} (${row.duration_seconds || 0}s) | HR: ${row.hr_mean || 72}bpm`;
+    } else if (selectedTable === 'diagnostic_events') {
+      summaryText = `Event #${row.event_id} | ${row.primary_hypothesis} (${(row.confidence * 100).toFixed(0)}%) [${(row.severity_tier || '').toUpperCase()}]`;
+    } else if (selectedTable === 'known_locations') {
+      summaryText = `Loc #${row.location_id} | ${row.name} | Dwells: ${row.dwell_count}`;
     } else if (selectedTable === 'location_visits') {
-      summaryText = `Visit #${row.visit_id} | Node #${row.location_node_id} | Enter: ${row.enter_date}`;
+      summaryText = `Visit #${row.visit_id} | Loc #${row.location_id} | Dur: ${row.duration_minutes || 0}m`;
+    } else if (selectedTable === 'baseline_states') {
+      summaryText = `Baseline: ${row.domain} (${row.sub_key}) | Samples: ${row.sample_count}`;
+    } else if (selectedTable === 'user_feedback') {
+      summaryText = `Feedback #${row.feedback_id} | Event #${row.event_id}: ${row.user_action}`;
+    } else if (selectedTable === 'emergency_escalations') {
+      summaryText = `Escalation #${row.escalation_id} | ${row.trigger_type} (${row.channel}) -> Status: ${row.dispatch_status}`;
     } else if (selectedTable === 'settings') {
       summaryText = `${row.key}: ${row.value}`;
-    } else if (selectedTable === 'contacts') {
-      summaryText = `${row.name} (${row.phone || row.email})`;
+    } else if (selectedTable === 'emergency_contacts') {
+      summaryText = `${row.name} (${row.phone || row.email || row.whatsapp})`;
     } else if (selectedTable === 'templates') {
       summaryText = `Template: ${row.name}`;
-    } else if (selectedTable === 'motion_clusters') {
-      summaryText = `Cluster #${row.cluster_id} (v${row.cluster_version})`;
-    } else if (selectedTable === 'episode_motion_timelines') {
-      summaryText = `Timeline #${row.timeline_id} | Ep #${row.episode_id}`;
     }
 
     return (

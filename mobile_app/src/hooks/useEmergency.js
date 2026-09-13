@@ -116,12 +116,17 @@ function base64Encode(str) {
   return result;
 }
 
+import { logEscalation } from '../Database.js';
+
 // Substitutes template placeholders with actual incident data.
-// The template uses {placeholder} syntax. All fields are replaced globally (g flag).
-// If a field is missing from `data`, it is replaced with an empty string (safe default).
 function compileTemplate(templateContent, data) {
   let message = templateContent || '';
   message = message.replace(/{name}/g, data.name || '');
+  message = message.replace(/{hypothesis}/g, data.hypothesis || '');
+  message = message.replace(/{severity}/g, data.severity || '');
+  message = message.replace(/{evidence}/g, data.evidence || '');
+  message = message.replace(/{vitals_summary}/g, data.vitals_summary || '');
+  message = message.replace(/{location_name}/g, data.location_name || '');
   message = message.replace(/{inference}/g, data.inference || '');
   message = message.replace(/{time}/g, data.time || '');
   message = message.replace(/{maps_link}/g, data.maps_link || '');
@@ -397,9 +402,20 @@ export default function useEmergency({
         }
       }
 
+      const diag = currentPacketRef.current.diagnostic;
+      const hypothesisStr = diag ? diag.primary_hypothesis : 'EMERGENCY_ALERT';
+      const severityStr = diag ? diag.severity_tier.toUpperCase() : 'URGENT';
+      const evidenceStr = diag && diag.contributing_evidence ? diag.contributing_evidence.join(', ') : 'Sensor threshold breach';
+      const vitalsSummaryStr = `HR: ${currentPacketRef.current.hr || 72} bpm, SpO2: ${currentPacketRef.current.spo2 || 98}%, Heat Index: ${currentPacketRef.current.heatIndexF || 75}°F (${currentPacketRef.current.heatIndexTier || 'NORMAL'})`;
+
       // Compile the template by substituting all placeholders with real values
       const compiledMsg = compileTemplate(templateContent, {
         name: dbSettingsRef.current.user_name || 'User',
+        hypothesis: hypothesisStr,
+        severity: severityStr,
+        evidence: evidenceStr,
+        vitals_summary: vitalsSummaryStr,
+        location_name: 'Current Location',
         inference: inferenceStr,
         time: new Date().toLocaleString(),
         maps_link: mapsLinkStr,
@@ -408,6 +424,23 @@ export default function useEmergency({
         medical_info: medicalStr,
         duress_flag: duressFlagStr
       });
+
+      try {
+        logEscalation({
+          event_id: diag ? diag.event_id : null,
+          trigger_type: isDuress ? 'DURESS_PIN' : (diag ? diag.primary_hypothesis : 'HARD_LIMIT_BREACH'),
+          contact_id: contact.id,
+          channel: contact.whatsapp_enabled ? 'WHATSAPP' : 'SMS',
+          message_body: compiledMsg,
+          latitude: coords ? coords.latitude : null,
+          longitude: coords ? coords.longitude : null,
+          address: addressStr,
+          dispatch_status: 'DISPATCHED',
+          is_duress: isDuress ? 1 : 0
+        });
+      } catch (err) {
+        console.warn('[useEmergency] Escalation logging failed:', err);
+      }
 
       // =========================================================================
       // CHANNEL A: SMS via Twilio REST API
