@@ -305,6 +305,14 @@ async function runAllTests() {
   const familiarity = LocationEngine.estimateFamiliarity(12.9716, 77.5946);
   logResult("Location Familiarity Score", familiarity >= 0.0 && familiarity <= 1.0, `Computed familiarity score: ${(familiarity * 100).toFixed(1)}%.`);
 
+  // Watchdog test
+  LocationEngine.checkWatchdog();
+  const watchdogOk = LocationEngine.locationStatus === 'OK';
+  LocationEngine.lastUpdateTimestamp = Date.now() - 35000; // simulate 35s stale
+  LocationEngine.checkWatchdog();
+  const watchdogStale = LocationEngine.locationStatus === 'STALE';
+  logResult("Location Watchdog", watchdogOk && watchdogStale, "Transitions from OK to STALE after 30s elapsed.");
+
   // ───────────────────────────────────────────────────────────────────────────
   // TEST 6: Context Engine Threat Scoring & Off-Wrist Safety
   // ───────────────────────────────────────────────────────────────────────────

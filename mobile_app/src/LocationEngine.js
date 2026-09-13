@@ -328,6 +328,25 @@ class LocationEngineClass {
     return Number(maxFamiliarity.toFixed(3));
   }
 
+  /**
+   * Detects if the GPS fix hasn't been updated in > 30 seconds.
+   * Sets locationStatus to 'STALE' to prevent candidate node creation from stale positions.
+   * Called periodically by App.js.
+   */
+  checkWatchdog() {
+    if (this.lastUpdateTimestamp === 0) return; // No GPS fix yet — skip
+    const elapsed = Date.now() - this.lastUpdateTimestamp;
+
+    if (elapsed >= 30000) { // 30 seconds without fix = stale
+      if (this.locationStatus !== 'STALE') {
+        this.locationStatus = 'STALE';
+        console.log('[LocationEngine] Watchdog: Location status set to STALE. GPS signal delayed.');
+      }
+    } else {
+      this.locationStatus = 'OK';
+    }
+  }
+
   getHaversineDistance(lat1, lon1, lat2, lon2) {
     const toRad = (x) => (x * Math.PI) / 180.0;
     const R = 6371000.0; // Earth radius in meters
@@ -335,8 +354,10 @@ class LocationEngineClass {
     const dLon = toRad(lon2 - lon1);
     const a =
       Math.sin(dLat / 2.0) * Math.sin(dLat / 2.0) +
-      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2.0) * Math.sin(dLon / 2.0);
+      Math.cos(toRad(lat1)) *
+        Math.cos(toRad(lat2)) *
+        Math.sin(dLon / 2.0) *
+        Math.sin(dLon / 2.0);
     const c = 2.0 * Math.atan2(Math.sqrt(a), Math.sqrt(1.0 - a));
     return R * c;
   }
