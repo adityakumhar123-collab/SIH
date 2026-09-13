@@ -18,7 +18,7 @@
 //   3. On connect: negotiates MTU (64 bytes), reads Device Info, subscribes to
 //      all 4 notification characteristics (EVENT, STATUS, SENSOR, FEATURE)
 //   4. On every BLE notification: decodes the packet via BleService.js, then:
-//      - FEATURE/EVENT → MotionEngine.onBLEPacket() → EpisodeEngine.updateEpisode()
+//      - MOTION/VITAL/ENV → EpisodeEngine.pushSample() → EpisodeEngine.processWindow()
 //      - FEATURE/EVENT → setCurrentPacket() to update React state for the dashboard
 //      - SENSOR → setStreamData() to update the live IMU waveform graph
 //      - STATUS → updates battery, wear confidence, uptime in React state
@@ -29,8 +29,7 @@
 // FILES USED:
 //   → BleService.js      for: parseIncomingPacket, UUIDs, base64ToUint8Array,
 //                              encodeSingleByteBase64
-//   → MotionEngine.js    for: MotionEngine.onBLEPacket(), MotionEngine.initialize()
-//   → EpisodeEngine.js   for: EpisodeEngine.updateEpisode()
+//   → EpisodeEngine.js   for: EpisodeEngine sample ingestion and window processing
 //   → LocationEngine.js  for: LocationEngine.currentGps, LocationEngine.estimateFamiliarity()
 //
 // OUTPUT (what this hook returns to App.js):
@@ -242,7 +241,7 @@ export default function useBle(activeTab, addLog) {
   // =============================================================================
   // Packet Handler — Called for every decoded BLE notification
   // Routes each packet type to the appropriate consumers:
-  //   FEATURE/EVENT → MotionEngine → EpisodeEngine → React state → UI logs
+  //   MOTION/VITAL/ENV → EpisodeEngine → React state → UI logs
   //   SENSOR        → streamData (graph) → UI logs (sampled 10%)
   //   STATUS        → battery/wear state → UI logs
   // =============================================================================
@@ -362,13 +361,16 @@ export default function useBle(activeTab, addLog) {
           }
 
           if (device) {
-            // Filter: only show SafeBand devices by name or service UUID match
-            const isSafeBand =
+            // Filter: only show RakshaBand / SafeBand devices by name or service UUID match
+            const isTargetDevice =
+              device.name === 'RakshaBand-ESP32' ||
               device.name === 'SafeBand-ESP32' ||
               device.name === 'SafeBand-IMU' ||
+              device.name?.startsWith('RakshaBand') ||
+              device.name?.startsWith('SafeBand') ||
               (device.serviceUUIDs && device.serviceUUIDs.includes(SERVICE_UUID));
 
-            if (isSafeBand) {
+            if (isTargetDevice) {
               setDevices((prevDevices) => {
                 // Avoid duplicates — check by device ID before adding
                 if (prevDevices.some((d) => d.id === device.id)) {
@@ -376,7 +378,7 @@ export default function useBle(activeTab, addLog) {
                 }
                 return [...prevDevices, {
                   id: device.id,
-                  name: device.name || 'SafeBand-ESP32',
+                  name: device.name || 'RakshaBand-ESP32',
                   rssi: device.rssi   // Signal strength (dBm) for display
                 }];
               });
@@ -409,7 +411,7 @@ export default function useBle(activeTab, addLog) {
   //   3. Wait 800ms for connection to stabilize (Android firmware quirk)
   //   4. Negotiate MTU = 64 bytes (prevents packet fragmentation for 34-byte packets)
   //   5. Discover all services and characteristics (builds the GATT table)
-  //   6. Initialize MotionEngine (clears buffer, loads cluster centroids)
+  //   6. Initialize EpisodeEngine (clears buffers, loads active episodes)
   //   7. Read DEVICE_INFO characteristic (one-time firmware version string)
   //   8. Subscribe to EVENT, STATUS, SENSOR, FEATURE characteristics
   //   9. Wait 1500ms for BLE descriptor subscriptions to stabilize

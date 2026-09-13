@@ -4,7 +4,7 @@ import styles from './styles';
 import { executeSql, executeRun } from '../Database';
 
 const DatabaseTab = React.memo(() => {
-  const [selectedTable, setSelectedTable] = useState('observations');
+  const [selectedTable, setSelectedTable] = useState('episodes');
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
