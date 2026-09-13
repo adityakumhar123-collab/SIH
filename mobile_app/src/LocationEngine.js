@@ -347,6 +347,55 @@ class LocationEngineClass {
     }
   }
 
+  /**
+   * Immediately registers a location as a permanent known node.
+   * Useful for immediate user registration (e.g., "Add Safe Location") and instant testing.
+   *
+   * @param {string} [name] - Friendly name
+   * @param {number} [customLat] - Explicit latitude
+   * @param {number} [customLon] - Explicit longitude
+   * @returns {number} New location ID
+   */
+  async registerCurrentLocation(name = null, customLat = null, customLon = null) {
+    let lat = customLat ?? this.currentGps?.latitude;
+    let lon = customLon ?? this.currentGps?.longitude;
+
+    if (!lat || !lon) {
+      try {
+        const Location = require('expo-location');
+        const fix = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        if (fix && fix.coords) {
+          lat = fix.coords.latitude;
+          lon = fix.coords.longitude;
+        }
+      } catch (e) {
+        // Fallback default coordinates if GPS unavailable in emulator/environment
+        lat = 12.9716;
+        lon = 77.5946;
+      }
+    }
+
+    const nodeCount = this.knownNodes.length + 1;
+    const newNode = {
+      name: name || `Location #${nodeCount}`,
+      center_latitude: lat,
+      center_longitude: lon,
+      entry_radius: this.ENTRY_RADIUS,
+      exit_radius: this.EXIT_RADIUS,
+      dwell_count: 1,
+      total_stay_minutes: 5.0,
+      baseline_temp_mean: 24.0,
+      baseline_humidity_mean: 50.0,
+      baseline_resting_hr: 72
+    };
+
+    const newId = saveKnownLocation(newNode);
+    this.candidateDwell = null;
+    this.refreshNodes();
+    this.startVisit(newId);
+    return newId;
+  }
+
   getHaversineDistance(lat1, lon1, lat2, lon2) {
     const toRad = (x) => (x * Math.PI) / 180.0;
     const R = 6371000.0; // Earth radius in meters

@@ -73,6 +73,15 @@ export function initDatabase() {
   if (isDbInitialized) return database;
 
   try {
+    // Purge obsolete SafeBand tables if migrating from previous builds
+    database.execSync(`
+      DROP TABLE IF EXISTS observations;
+      DROP TABLE IF EXISTS motion_clusters;
+      DROP TABLE IF EXISTS episode_motion_timelines;
+      DROP TABLE IF EXISTS inference_logs;
+      DROP TABLE IF EXISTS location_nodes;
+    `);
+
     // 1. settings
     database.execSync(`
       CREATE TABLE IF NOT EXISTS settings (

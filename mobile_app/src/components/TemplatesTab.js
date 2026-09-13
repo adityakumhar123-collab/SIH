@@ -36,7 +36,7 @@ const TemplatesTab = React.memo(({
           </View>
         </View>
         <Text style={[styles.multiplierItem, { marginTop: 8, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', fontSize: 11, color: '#CBD5E1', padding: 8, backgroundColor: 'rgba(0,0,0,0.15)', borderRadius: 6 }]}>
-          🚨 SafeBand Alert: Physical emergency detected!{'\n'}
+          🚨 RakshaBand Emergency Alert: Physical emergency detected!{'\n'}
           Name: {"{name}"}{'\n'}
           Inference: {"{inference}"}{'\n'}
           Time: {"{time}"}{'\n'}

@@ -2,42 +2,137 @@ import React, { useState, useEffect } from 'react';
 import { View, Text, TouchableOpacity, ScrollView, Alert, ActivityIndicator, Platform } from 'react-native';
 import styles from './styles';
 import { executeSql, executeRun } from '../Database';
+import { LocationEngine } from '../LocationEngine';
+
+const TABLE_METADATA = {
+  episodes: {
+    label: 'Episodes (Telemetry)',
+    pk: 'episode_id',
+    formatRow: (row) => `Episode #${row.episode_id} • ${row.activity_class || 'standing'} (${row.duration_seconds || 0}s) • HR: ${row.hr_mean ? Math.round(row.hr_mean) : 72} bpm • SpO2: ${row.spo2_mean ? Math.round(row.spo2_mean) : 98}%`
+  },
+  diagnostic_events: {
+    label: 'Diagnostic Reasoning',
+    pk: 'event_id',
+    formatRow: (row) => `Diagnostic #${row.event_id} • ${row.primary_hypothesis} (${Math.round((row.confidence || 0) * 100)}%) [${(row.severity_tier || 'advisory').toUpperCase()}]`
+  },
+  known_locations: {
+    label: 'Known Locations',
+    pk: 'location_id',
+    formatRow: (row) => `Location #${row.location_id}: ${row.name || 'Saved Place'} • Dwells: ${row.dwell_count || 1} • Total Stay: ${row.total_stay_minutes || 0}m`
+  },
+  location_visits: {
+    label: 'Location Visits',
+    pk: 'visit_id',
+    formatRow: (row) => `Visit #${row.visit_id} • Location #${row.location_id} • Duration: ${row.duration_minutes || 0}m`
+  },
+  baseline_states: {
+    label: 'Physiological Baselines',
+    pk: 'domain',
+    formatRow: (row) => `Baseline: ${row.domain} (${row.sub_key}) • Samples: ${row.sample_count} • Source: ${row.source || 'EWMA'}`
+  },
+  user_feedback: {
+    label: 'User Actions & Feedback',
+    pk: 'feedback_id',
+    formatRow: (row) => `Feedback #${row.feedback_id} • Event #${row.event_id} • Action: ${row.user_action}`
+  },
+  emergency_escalations: {
+    label: 'Emergency Escalations',
+    pk: 'escalation_id',
+    formatRow: (row) => `Escalation #${row.escalation_id} • ${row.trigger_type} via ${row.channel} → ${row.dispatch_status}`
+  },
+  emergency_contacts: {
+    label: 'Emergency Contacts',
+    pk: 'id',
+    formatRow: (row) => `Contact: ${row.name || 'Unnamed'} • ${row.phone || row.email || row.whatsapp || 'No contact details'}`
+  },
+  templates: {
+    label: 'Alert Templates',
+    pk: 'id',
+    formatRow: (row) => `Template #${row.id}: ${row.name || 'Standard Alert'}`
+  },
+  settings: {
+    label: 'Application Settings',
+    pk: 'key',
+    formatRow: (row) => `${row.key} = ${row.value !== undefined && row.value !== '' ? row.value : '(not set)'}`
+  }
+};
 
 const DatabaseTab = React.memo(() => {
+  const [availableTables, setAvailableTables] = useState([]);
   const [selectedTable, setSelectedTable] = useState('episodes');
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [expandedRows, setExpandedRows] = useState({});
 
-  const TABLES = [
-    { name: 'episodes', label: '🎬 Episodes' },
-    { name: 'diagnostic_events', label: '🧠 Diagnostics' },
-    { name: 'known_locations', label: '📍 Locations' },
-    { name: 'location_visits', label: '🚪 Visits' },
-    { name: 'baseline_states', label: '📈 Baselines' },
-    { name: 'user_feedback', label: '💬 Feedback' },
-    { name: 'emergency_escalations', label: '🚨 Escalations' },
-    { name: 'emergency_contacts', label: '👥 Contacts' },
-    { name: 'templates', label: '📝 Templates' },
-    { name: 'settings', label: '⚙️ Settings' }
-  ];
+  // Query actual SQLite master table so the list is always 100% accurate
+  const refreshTableList = () => {
+    try {
+      const dbTables = executeSql("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';") || [];
+      const names = dbTables.map(t => t.name);
+
+      const preferredOrder = [
+        'episodes',
+        'diagnostic_events',
+        'known_locations',
+        'location_visits',
+        'baseline_states',
+        'user_feedback',
+        'emergency_escalations',
+        'emergency_contacts',
+        'templates',
+        'settings'
+      ];
+
+      const ordered = [];
+      for (const p of preferredOrder) {
+        if (names.includes(p)) ordered.push(p);
+      }
+      for (const n of names) {
+        if (!ordered.includes(n)) ordered.push(n);
+      }
+
+      const formatted = ordered.map(name => ({
+        name,
+        label: TABLE_METADATA[name]?.label || name
+      }));
+
+      setAvailableTables(formatted);
+      if (formatted.length > 0 && !names.includes(selectedTable)) {
+        setSelectedTable(formatted[0].name);
+      }
+    } catch (e) {
+      // Fallback
+      setAvailableTables(Object.keys(TABLE_METADATA).map(name => ({
+        name,
+        label: TABLE_METADATA[name].label
+      })));
+    }
+  };
+
+  useEffect(() => {
+    refreshTableList();
+  }, []);
+
+  const handleRegisterCurrentLocation = async () => {
+    try {
+      setLoading(true);
+      const newId = await LocationEngine.registerCurrentLocation('Current Registered Location');
+      Alert.alert('📍 Location Registered', `Registered Known Location Node #${newId} with coordinates.`);
+      fetchTableData('known_locations');
+    } catch (err) {
+      Alert.alert('Error', `Failed to register location: ${err.message}`);
+      setLoading(false);
+    }
+  };
 
   const fetchTableData = (tableName) => {
     setLoading(true);
     setError(null);
     setExpandedRows({});
     try {
-      let pkCol = 'rowid';
-      if (tableName === 'episodes') pkCol = 'episode_id';
-      else if (tableName === 'diagnostic_events') pkCol = 'event_id';
-      else if (tableName === 'known_locations') pkCol = 'location_id';
-      else if (tableName === 'location_visits') pkCol = 'visit_id';
-      else if (tableName === 'user_feedback') pkCol = 'feedback_id';
-      else if (tableName === 'emergency_escalations') pkCol = 'escalation_id';
-      else if (tableName === 'emergency_contacts') pkCol = 'id';
-      else if (tableName === 'templates') pkCol = 'id';
-      else if (tableName === 'settings') pkCol = 'key';
+      const meta = TABLE_METADATA[tableName];
+      const pkCol = meta?.pk || 'rowid';
 
       const sql = (tableName === 'settings' || tableName === 'baseline_states')
         ? `SELECT * FROM ${tableName} LIMIT 50;`
@@ -89,30 +184,8 @@ const DatabaseTab = React.memo(() => {
 
   const renderRow = (row, index) => {
     const isExpanded = expandedRows[index];
-    
-    // Get a brief identifier for the row summary header
-    let summaryText = `Row #${index + 1}`;
-    if (selectedTable === 'episodes') {
-      summaryText = `Ep #${row.episode_id} | ${row.activity_class} (${row.duration_seconds || 0}s) | HR: ${row.hr_mean || 72}bpm`;
-    } else if (selectedTable === 'diagnostic_events') {
-      summaryText = `Event #${row.event_id} | ${row.primary_hypothesis} (${(row.confidence * 100).toFixed(0)}%) [${(row.severity_tier || '').toUpperCase()}]`;
-    } else if (selectedTable === 'known_locations') {
-      summaryText = `Loc #${row.location_id} | ${row.name} | Dwells: ${row.dwell_count}`;
-    } else if (selectedTable === 'location_visits') {
-      summaryText = `Visit #${row.visit_id} | Loc #${row.location_id} | Dur: ${row.duration_minutes || 0}m`;
-    } else if (selectedTable === 'baseline_states') {
-      summaryText = `Baseline: ${row.domain} (${row.sub_key}) | Samples: ${row.sample_count}`;
-    } else if (selectedTable === 'user_feedback') {
-      summaryText = `Feedback #${row.feedback_id} | Event #${row.event_id}: ${row.user_action}`;
-    } else if (selectedTable === 'emergency_escalations') {
-      summaryText = `Escalation #${row.escalation_id} | ${row.trigger_type} (${row.channel}) -> Status: ${row.dispatch_status}`;
-    } else if (selectedTable === 'settings') {
-      summaryText = `${row.key}: ${row.value}`;
-    } else if (selectedTable === 'emergency_contacts') {
-      summaryText = `${row.name} (${row.phone || row.email || row.whatsapp})`;
-    } else if (selectedTable === 'templates') {
-      summaryText = `Template: ${row.name}`;
-    }
+    const meta = TABLE_METADATA[selectedTable];
+    const summaryText = meta?.formatRow ? meta.formatRow(row) : `Row #${index + 1}`;
 
     return (
       <View key={index} style={{
@@ -168,7 +241,7 @@ const DatabaseTab = React.memo(() => {
     <View style={styles.card}>
       <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <Text style={styles.cardTitle}>📁 Database Viewer</Text>
-        <TouchableOpacity delayPressIn={0} onPress={() => fetchTableData(selectedTable)} style={{
+        <TouchableOpacity delayPressIn={0} onPress={() => { refreshTableList(); fetchTableData(selectedTable); }} style={{
           backgroundColor: 'rgba(59, 130, 246, 0.15)',
           borderColor: '#3B82F6',
           borderWidth: 1,
@@ -182,7 +255,7 @@ const DatabaseTab = React.memo(() => {
 
       {/* Table select buttons scroll list */}
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 16 }}>
-        {TABLES.map((tab) => (
+        {availableTables.map((tab) => (
           <TouchableOpacity
             delayPressIn={0}
             key={tab.name}
@@ -203,6 +276,27 @@ const DatabaseTab = React.memo(() => {
           </TouchableOpacity>
         ))}
       </ScrollView>
+
+      {selectedTable === 'known_locations' && (
+        <TouchableOpacity
+          delayPressIn={0}
+          onPress={handleRegisterCurrentLocation}
+          style={{
+            backgroundColor: 'rgba(16, 185, 129, 0.15)',
+            borderColor: '#10B981',
+            borderWidth: 1,
+            borderRadius: 10,
+            paddingVertical: 10,
+            paddingHorizontal: 14,
+            alignItems: 'center',
+            marginBottom: 14
+          }}
+        >
+          <Text style={{ color: '#10B981', fontSize: 13, fontWeight: 'bold' }}>
+            📍 + Register Current GPS as Known Location
+          </Text>
+        </TouchableOpacity>
+      )}
 
       {loading ? (
         <ActivityIndicator size="large" color="#3B82F6" style={{ marginVertical: 24 }} />

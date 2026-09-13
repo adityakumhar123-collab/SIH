@@ -313,6 +313,10 @@ async function runAllTests() {
   const watchdogStale = LocationEngine.locationStatus === 'STALE';
   logResult("Location Watchdog", watchdogOk && watchdogStale, "Transitions from OK to STALE after 30s elapsed.");
 
+  // Manual / Immediate Location Registration test
+  const registeredNodeId = await LocationEngine.registerCurrentLocation("Home Test", 12.9716, 77.5946);
+  logResult("Immediate Location Registration", registeredNodeId > 0 && LocationEngine.knownNodes.length === 1, `Created Known Location ID ${registeredNodeId} (Total nodes: ${LocationEngine.knownNodes.length}).`);
+
   // ───────────────────────────────────────────────────────────────────────────
   // TEST 6: Context Engine Threat Scoring & Off-Wrist Safety
   // ───────────────────────────────────────────────────────────────────────────

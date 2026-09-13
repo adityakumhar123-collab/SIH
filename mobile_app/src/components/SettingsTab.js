@@ -350,11 +350,11 @@ const SettingsTab = React.memo(({
       <View style={[styles.card, { borderColor: 'rgba(59, 130, 246, 0.15)' }]}>
         <Text style={[styles.cardTitle, { color: '#60A5FA' }]}>ℹ️ Do Not Disturb Whitelisting</Text>
         <Text style={styles.multiplierItem}>
-          To make sure the SafeBand buzzer triggers in silent/DND mode, do the following:
+          To make sure the RakshaBand buzzer triggers in silent/DND mode, do the following:
         </Text>
         <Text style={[styles.multiplierItem, { color: '#CBD5E1', paddingLeft: 8 }]}>
-          • Android: Go to Settings &gt; Apps &gt; SafeBand &gt; Notifications &gt; Allow Do Not Disturb override.{'\n'}
-          • iOS: Go to Settings &gt; Focus &gt; Do Not Disturb &gt; Allowed Apps &gt; Add SafeBand app to allowed list.
+          • Android: Go to Settings &gt; Apps &gt; RakshaBand &gt; Notifications &gt; Allow Do Not Disturb override.{'\n'}
+          • iOS: Go to Settings &gt; Focus &gt; Do Not Disturb &gt; Allowed Apps &gt; Add RakshaBand app to allowed list.
         </Text>
       </View>
     </View>
