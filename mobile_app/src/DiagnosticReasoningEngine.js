@@ -78,8 +78,16 @@ class DiagnosticReasoningEngineClass {
     const isRestingMotion = RESTING_MOTION_CLASSES.has(activityClass);
 
     // ── 1. Check Hard Limits & Direct Fall Bypass ──────────────────────────────
-    // Direct Fall Bypass: impact > 3.5g (3500 mg) and linear trajectory ratio > 0.70
-    if (peakAccelMg >= 3500 && eigenvalueRatio >= 0.70) {
+    // Direct Fall Bypass:
+    // Requires a true sudden impact (peak accel >= 4000 mg / 4.0g) with linear vector (eigenvalueRatio >= 0.70)
+    // and non-active post-impact state, but explicitly excludes seated desk activities (sitting, typing, eating, scrolling)
+    // where table taps and gestures create false high-frequency spikes.
+    const nonFallDeskActivities = new Set(['sitting', 'typing', 'eating', 'scrolling', 'drinking_bottle']);
+    const isDeskActivity = nonFallDeskActivities.has(activityClass);
+    const isExplicitFall = (activityClass === 'fall' || activityClass === 'lying' || activityClass === 'laying') && peakAccelMg >= 3000;
+    const isImpactWithoutActiveMotion = !isActiveMotion && !isDeskActivity && peakAccelMg >= 4000 && eigenvalueRatio >= 0.70;
+
+    if (isExplicitFall || isImpactWithoutActiveMotion) {
       return {
         domain: 'motion',
         primary_hypothesis: HYPOTHESES.FALL_HARD_IMPACT,
@@ -98,8 +106,11 @@ class DiagnosticReasoningEngineClass {
     }
 
     // Critical Clinical Hard Limits (NEWS2 red flags)
-    if (spo2 <= 85.0 || hr >= 180 || (hr <= 40 && hr > 0)) {
-      const reason = spo2 <= 85.0
+    const isCriticalSpo2 = spo2 > 0 && spo2 <= 85.0;
+    const isCriticalHr = hr >= 180 || (hr <= 40 && hr > 0);
+
+    if (isCriticalSpo2 || isCriticalHr) {
+      const reason = isCriticalSpo2
         ? `Severe Hypoxemia (SpO2: ${spo2}%)`
         : hr >= 180
         ? `Extreme Tachycardia (HR: ${hr} bpm)`
@@ -107,7 +118,7 @@ class DiagnosticReasoningEngineClass {
 
       return {
         domain: 'physiology',
-        primary_hypothesis: spo2 <= 85.0 ? HYPOTHESES.RESPIRATORY_CONCERN : HYPOTHESES.CARDIOVASCULAR_CONCERN,
+        primary_hypothesis: isCriticalSpo2 ? HYPOTHESES.RESPIRATORY_CONCERN : HYPOTHESES.CARDIOVASCULAR_CONCERN,
         confidence: 0.98,
         contributing_evidence: [reason, `SpO2 z-score: ${zSpo2}σ`, `HR z-score: ${zHr}σ`],
         severity_tier: 'urgent',
@@ -189,20 +200,22 @@ class DiagnosticReasoningEngineClass {
     // Depressed SpO2 with elevated HR in normal environment
     let scoreResp = 0.0;
     const evidenceResp = [];
-    if (zSpo2 <= -1.8 || spo2 <= 92.0) {
+    if (spo2 > 0 && (zSpo2 <= -1.8 || spo2 <= 92.0)) {
       scoreResp += Math.min(0.55, Math.abs(zSpo2) * 0.25);
       evidenceResp.push(`Oxygen desaturation to ${spo2}% (${zSpo2}σ)`);
     }
-    if (zHr >= 1.2 || zHr <= -1.5) {
-      scoreResp += 0.25;
-      evidenceResp.push(`Compensatory/irregular HR: ${hr} bpm`);
-    }
-    if (heatIndex.riskLevel <= 1) {
-      scoreResp += 0.15;
-      evidenceResp.push('Normal ambient environmental conditions');
-    }
-    if (persistenceMinutes >= 2) {
-      scoreResp += 0.10;
+    if (scoreResp > 0) {
+      if (hr > 0 && (zHr >= 1.2 || zHr <= -1.5)) {
+        scoreResp += 0.25;
+        evidenceResp.push(`Compensatory/irregular HR: ${hr} bpm`);
+      }
+      if (heatIndex.riskLevel <= 1) {
+        scoreResp += 0.15;
+        evidenceResp.push('Normal ambient environmental conditions');
+      }
+      if (persistenceMinutes >= 2) {
+        scoreResp += 0.10;
+      }
     }
     scores[HYPOTHESES.RESPIRATORY_CONCERN] = scoreResp;
     evidenceLists[HYPOTHESES.RESPIRATORY_CONCERN] = evidenceResp;
@@ -211,20 +224,22 @@ class DiagnosticReasoningEngineClass {
     // Persistent elevated HR while completely resting in mild environment
     let scoreCardio = 0.0;
     const evidenceCardio = [];
-    if (zHr >= 2.2 && isRestingMotion) {
+    if (hr > 0 && zHr >= 2.2 && isRestingMotion) {
       scoreCardio += Math.min(0.50, zHr * 0.18);
       evidenceCardio.push(`Unexplained tachycardia at rest (${hr} bpm, +${zHr}σ)`);
-    } else if (zHr <= -2.5 && isRestingMotion) {
+    } else if (hr > 0 && zHr <= -2.5 && isRestingMotion) {
       scoreCardio += 0.50;
       evidenceCardio.push(`Unexplained resting bradycardia (${hr} bpm, ${zHr}σ)`);
     }
-    if (heatIndex.riskLevel === 0) {
-      scoreCardio += 0.25;
-      evidenceCardio.push('Ambient temperature and humidity strictly normal');
-    }
-    if (persistenceMinutes >= 5) {
-      scoreCardio += 0.20;
-      evidenceCardio.push(`Resting elevation sustained for ${persistenceMinutes} mins`);
+    if (scoreCardio > 0) {
+      if (heatIndex.riskLevel === 0) {
+        scoreCardio += 0.20;
+        evidenceCardio.push('Ambient temperature and humidity strictly normal');
+      }
+      if (persistenceMinutes >= 5) {
+        scoreCardio += 0.20;
+        evidenceCardio.push(`Resting elevation sustained for ${persistenceMinutes} mins`);
+      }
     }
     scores[HYPOTHESES.CARDIOVASCULAR_CONCERN] = scoreCardio;
     evidenceLists[HYPOTHESES.CARDIOVASCULAR_CONCERN] = evidenceCardio;
@@ -321,7 +336,7 @@ class DiagnosticReasoningEngineClass {
       suggested_action_category: actionCategory,
       decomposed_zscores: { hr: zHr, spo2: zSpo2 },
       mahalanobis_distances: { physiology: physEval.distance, environment: envEval.distance },
-      is_direct_escalation: severityTier === 'urgent'
+      is_direct_escalation: false
     };
   }
 }

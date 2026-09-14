@@ -32,7 +32,10 @@ import {
   saveUserFeedback,
   logEscalation,
   enforceRetentionPolicy,
-  executeSql
+  executeSql,
+  updateLocationName,
+  getCleanLocationName,
+  getLocationHistoricalData
 } from './src/Database.js';
 
 import {
@@ -356,6 +359,42 @@ async function runAllTests() {
     `Healthy workout dampened threat score: ${exertionAssessment.threatScore} (Dampened from high HR during run).`
   );
 
+  // Healthy daily vitals (HR=85, SpO2=96) non-outlier test
+  const healthyVitalsEval = MathematicalEngine.evaluateDomain('physiology', [85, 96]);
+  logResult(
+    "Healthy Normal Vitals Tolerance (HR=85, SpO2=96%)",
+    healthyVitalsEval.isOutlier === false && healthyVitalsEval.distance < 3.0,
+    `Healthy vitals within tolerance: DM=${healthyVitalsEval.distance.toFixed(3)} < 3.0 (isOutlier: ${healthyVitalsEval.isOutlier})`
+  );
+
+  // Cooldown dampening test (post-dismissal suppression)
+  const cooldownAssessment = computeThreatScoreDetailed({
+    anomalyScore: 0.95,
+    isDirectEscalation: true,
+    wearConfidence: 100
+  }, { cooldownActive: true });
+  logResult(
+    "Post-Dismissal Cooldown Suppression",
+    cooldownAssessment.threatScore === 0.25 && cooldownAssessment.threatLevel.name === 'NORMAL',
+    `Threat suppressed during cooldown: score=${cooldownAssessment.threatScore} (Level: ${cooldownAssessment.threatLevel.name})`
+  );
+
+  // Catastrophic hypoxemia hard boundary test
+  const diagHypoxemia = DiagnosticReasoningEngine.evaluate({
+    hr: 75,
+    spo2: 83.0,
+    activityClass: 'sitting'
+  });
+  const hypoxemiaAssessment = computeThreatScoreDetailed({
+    diagnostic: diagHypoxemia,
+    wearConfidence: 100
+  });
+  logResult(
+    "Catastrophic Hypoxemia Direct Escalation (SpO2 <= 85%)",
+    diagHypoxemia.is_direct_escalation === true && hypoxemiaAssessment.threatScore >= 0.72,
+    `Severe hypoxemia escalated directly: SpO2=83% -> threatScore=${hypoxemiaAssessment.threatScore} (CRITICAL)`
+  );
+
   // ───────────────────────────────────────────────────────────────────────────
   // TEST 7: Local On-Device Gemma 3n AI Guidance (Privacy-First)
   // ───────────────────────────────────────────────────────────────────────────
@@ -426,6 +465,127 @@ async function runAllTests() {
     "Baseline Recalibration Service",
     recalibReport.success === true && recalibReport.locationsChecked >= 1,
     `Recalibrated baselines across ${recalibReport.locationsChecked} registered location nodes.`
+  );
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 9: Spatial Vector Radar, Safe Naming & Historical Telemetry
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log("\n--- 9. Spatial Vector Radar & Location Naming Verification ---");
+
+  // 1. getCleanLocationName sanitization
+  const testNodeNull = { name: null, location_id: 4 };
+  const testNodeStrNull = { name: 'null', location_id: 5 };
+  const testNodeEmpty = { name: '   ', location_id: 6 };
+  const testNodeCustom = { name: 'Home Office', location_id: 7 };
+
+  const cleanNull = getCleanLocationName(testNodeNull);
+  const cleanStrNull = getCleanLocationName(testNodeStrNull);
+  const cleanEmpty = getCleanLocationName(testNodeEmpty);
+  const cleanCustom = getCleanLocationName(testNodeCustom);
+
+  const cleanPassed =
+    cleanNull === 'Zone #4' &&
+    cleanStrNull === 'Zone #5' &&
+    cleanEmpty === 'Zone #6' &&
+    cleanCustom === 'Home Office';
+
+  logResult(
+    "Location Name Sanitization",
+    cleanPassed,
+    `Cleanly transformed: null -> "${cleanNull}", 'null' -> "${cleanStrNull}", '' -> "${cleanEmpty}", custom -> "${cleanCustom}"`
+  );
+
+  // 2. updateLocationName
+  const rawNodeId = saveKnownLocation({
+    name: null,
+    center_latitude: 12.9750,
+    center_longitude: 77.5990,
+    entry_radius: 25.0
+  });
+  updateLocationName(rawNodeId, 'Fitness Gym');
+  const updatedNodes = getKnownLocations();
+  const foundNode = updatedNodes.find(n => n.location_id === rawNodeId);
+  logResult(
+    "Location Name Mutation & SQLite Persistence",
+    foundNode && foundNode.name === 'Fitness Gym',
+    `Updated node #${rawNodeId} name to "${foundNode?.name}" successfully.`
+  );
+
+  // 3. getLocationHistoricalData
+  saveEpisode({
+    location_id: rawNodeId,
+    activity_class: 'running',
+    activity_confidence: 0.96,
+    hr_mean: 135,
+    spo2_mean: 97,
+    temperature_mean: 28.5,
+    humidity_mean: 62.0,
+    pressure_mean: 1010.5,
+    heat_index_mean: 82.0
+  });
+
+  const history = getLocationHistoricalData(rawNodeId);
+  const historyPassed =
+    history !== null &&
+    history.node !== null &&
+    history.lastEpisode !== null &&
+    history.lastEpisode.activity_class === 'running' &&
+    history.lastEpisode.temperature_mean === 28.5 &&
+    history.lastEpisode.pressure_mean === 1010.5;
+
+  logResult(
+    "Node Historical Telemetry Retrieval",
+    historyPassed,
+    `Retrieved last environment (Temp: ${history?.lastEpisode?.temperature_mean}°C, Press: ${history?.lastEpisode?.pressure_mean} hPa) & motion (${history?.lastEpisode?.activity_class}).`
+  );
+
+  // 4. LocationEngine.getNearestNodes (5 Nearest Nodes Algorithm)
+  LocationEngine.knownNodes = [];
+  // Seed 8 nodes at various distances
+  const baseLat = 12.9716;
+  const baseLon = 77.5946;
+  for (let i = 1; i <= 8; i++) {
+    LocationEngine.knownNodes.push({
+      location_id: i,
+      name: i === 1 ? 'Office' : null,
+      center_latitude: baseLat + i * 0.001, // ~110m per 0.001 deg
+      center_longitude: baseLon + i * 0.001,
+      entry_radius: 25.0,
+      dwell_count: i
+    });
+  }
+
+  const nearest5 = LocationEngine.getNearestNodes(5, baseLat, baseLon);
+  const nearestPassed =
+    nearest5.length === 5 &&
+    nearest5[0].location_id === 1 &&
+    nearest5[4].location_id === 5 &&
+    nearest5[0].distMeters < nearest5[4].distMeters &&
+    typeof nearest5[0].dx === 'number' &&
+    typeof nearest5[0].dy === 'number';
+
+  logResult(
+    "5 Nearest Nodes Proximity & Projection",
+    nearestPassed,
+    `Filtered 8 nodes down to top 5 (Nearest: ${nearest5[0]?.distMeters}m, 5th: ${nearest5[4]?.distMeters}m).`
+  );
+
+  // 5. LocationEngine Node Event Dispatch
+  let receivedEvent = null;
+  LocationEngine.setNodeEventListener((evt) => {
+    receivedEvent = evt;
+  });
+
+  const registeredId = await LocationEngine.registerCurrentLocation(null, baseLat, baseLon);
+  const eventPassed =
+    receivedEvent !== null &&
+    receivedEvent.type === 'NEW_NODE_CREATED' &&
+    receivedEvent.node.location_id === registeredId;
+
+  logResult(
+    "Node Registration Event Listener Dispatch",
+    eventPassed,
+    `Dispatched event: ${receivedEvent?.type} for Node #${receivedEvent?.node?.location_id}.`
   );
 
   console.log("\n================================================================");

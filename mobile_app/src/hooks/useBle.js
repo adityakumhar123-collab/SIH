@@ -239,19 +239,39 @@ export default function useBle(activeTab, addLog) {
   }, []); // Empty deps: runs only once on mount
 
   // =============================================================================
-  // Packet Handler — Called for every decoded BLE notification
-  // Routes each packet type to the appropriate consumers:
-  //   MOTION/VITAL/ENV → EpisodeEngine → React state → UI logs
-  //   SENSOR        → streamData (graph) → UI logs (sampled 10%)
-  //   STATUS        → battery/wear state → UI logs
+  // PACKET HANDLER & PIPELINE ROUTING
+  // =============================================================================
+  // Invoked on every valid BLE characteristic notification. Routes incoming
+  // packets based on their 1-byte header:
+  //
+  // 1. TYPE 0x01 (MOTION - 100 Hz):
+  //    - Pushes raw 6-DoF sample [ax, ay, az, gx, gy, gz] to EpisodeEngine buffer.
+  //    - Throttles UI waveform updates to 5 Hz (every 200ms) to conserve the JS thread.
+  //    - Triggers EpisodeEngine.processWindow() every 50 samples (2.0 Hz inference rate).
+  //    - When a 2.0s window finishes, unpacks:
+  //        * Activity classification & confidence (Model v3 21-class)
+  //        * Physiological vitals (HR, SpO2, HRV) from PPG
+  //        * NOAA Heat Index & risk tier
+  //        * Clinical Diagnostic Contract from DiagnosticReasoningEngine
+  //        * Updates `currentPacket` React state, which triggers App.js Loop 2.
+  //
+  // 2. TYPE 0x02 (STATUS / HEARTBEAT - ~30s):
+  //    - Updates `batteryPct`, `uptime`, and logs firmware version.
+  //
+  // 3. TYPE 0x03 (ENVIRONMENT - 1 Hz):
+  //    - Pushes ambient temperature, pressure, humidity to EpisodeEngine.
+  //
+  // 4. TYPE 0x04 (VITALS / PPG - 100 Hz):
+  //    - Pushes raw MAX30102 Red & IR photodiode counts to EpisodeEngine.
   // =============================================================================
   const handleIncomingPacket = (parsed) => {
     if (!parsed) return;
 
     if (parsed.type === 'MOTION') {
+      // Feed raw IMU sample into the 200-sample sliding window buffer
       EpisodeEngine.pushMotionSample([parsed.ax, parsed.ay, parsed.az, parsed.gx, parsed.gy, parsed.gz]);
 
-      // Throttle graph waveform updates to 5 Hz (every 200ms)
+      // Throttle graph waveform updates to 5 Hz (every 200ms) for UI smoothness
       if (isStreaming && activeTabRef.current === 'DASHBOARD') {
         const now = Date.now();
         if (now - lastGraphUpdateRef.current > 200) {
@@ -261,7 +281,8 @@ export default function useBle(activeTab, addLog) {
               ax: parsed.rawMg ? parsed.rawMg[0] : Math.round(parsed.ax * 101.97),
               ay: parsed.rawMg ? parsed.rawMg[1] : Math.round(parsed.ay * 101.97),
               az: parsed.rawMg ? parsed.rawMg[2] : Math.round(parsed.az * 101.97),
-              resultant: Math.round(parsed.resultantMps2 * 101.97)
+              resultant: Math.round(parsed.resultantMps2 * 101.97),
+              anomalyScore: 0
             };
             const newData = [...prevData, frame];
             if (newData.length > 50) newData.shift();
@@ -270,10 +291,11 @@ export default function useBle(activeTab, addLog) {
         }
       }
 
-      // Process 200-sample window if accumulated (every 50 samples = 2 Hz)
+      // Process 200-sample window if accumulated (every 50 samples = 2 Hz tick)
       try {
         const windowResult = EpisodeEngine.processWindow();
         if (windowResult) {
+          // Commit inferred features and clinical diagnostics to React state
           setCurrentPacket((prev) => ({
             ...prev,
             activityClass: windowResult.activityClass,
@@ -282,6 +304,8 @@ export default function useBle(activeTab, addLog) {
             spo2: windowResult.vitals.spo2,
             hrv: windowResult.vitals.hrv,
             tempC: EpisodeEngine.latestEnv.tempC,
+            humidityPct: EpisodeEngine.latestEnv.humPct,
+            pressureHpa: EpisodeEngine.latestEnv.pressHpa,
             heatIndexF: windowResult.heatIndex.heatIndexF,
             heatIndexTier: windowResult.heatIndex.tier,
             diagnostic: windowResult.diagnostic,
@@ -290,6 +314,7 @@ export default function useBle(activeTab, addLog) {
             wearConfidence: 100
           }));
 
+          // Log diagnostic hypothesis shifts to Diagnostics Terminal
           if (windowResult.diagnostic && windowResult.diagnostic.primary_hypothesis !== 'ANOMALY_UNCLEAR') {
             addLog(
               `🧠 Diagnostic Engine: ${windowResult.diagnostic.primary_hypothesis} (${(windowResult.diagnostic.confidence * 100).toFixed(0)}%) [${windowResult.diagnostic.severity_tier.toUpperCase()}] — Evidence: ${windowResult.diagnostic.contributing_evidence.join('; ')}`,
@@ -301,10 +326,19 @@ export default function useBle(activeTab, addLog) {
         console.warn('[BLE] EpisodeEngine window processing failed:', err);
       }
     } else if (parsed.type === 'VITAL') {
+      // Ingest raw 100 Hz photodiode counts
       EpisodeEngine.pushVitalSample(parsed.red, parsed.ir);
     } else if (parsed.type === 'ENVIRONMENT') {
+      // Ingest ambient BMP280 atmospheric readings
       EpisodeEngine.pushEnvironmentSample(parsed.tempC, parsed.pressureHpa, parsed.humidityPct);
+      setCurrentPacket((prev) => ({
+        ...prev,
+        tempC: parsed.tempC,
+        pressureHpa: parsed.pressureHpa,
+        humidityPct: parsed.humidityPct
+      }));
     } else if (parsed.type === 'STATUS') {
+      // Ingest periodic device health heartbeat
       if (parsed.batteryPct !== undefined) setBatteryPct(parsed.batteryPct);
       if (parsed.uptimeMinutes !== undefined) setUptime(parsed.uptimeMinutes);
       addLog(`Status: Battery=${parsed.batteryPct}%, Uptime=${parsed.uptimeMinutes}m, FW=${parsed.fwVersion}`, 'SYSTEM');
@@ -587,6 +621,26 @@ export default function useBle(activeTab, addLog) {
         console.log('[BLE] Device disconnected on connection loss.');
         setActiveDevice(null);
         setConnectionState('DISCONNECTED');
+        setIsStreaming(false);
+        setWearConfidence(0);
+        setCurrentPacket({
+          activityClass: 'standing',
+          activityConfidence: 1.0,
+          hr: 72,
+          spo2: 98.0,
+          hrv: 45.0,
+          tempC: 24.0,
+          heatIndexF: 75.0,
+          heatIndexTier: 'NORMAL',
+          diagnostic: null,
+          isDirectEscalation: false,
+          anomalyScore: 0.05,
+          peakAccel: 1000,
+          wearConfidence: 0,
+          motionState: 1,
+          motionEmbedding: new Array(32).fill(0),
+        });
+        addLog('Device disconnected. Sensor telemetry and threat monitoring reset to IDLE.', 'SYSTEM');
       });
 
     } catch (err) {
@@ -608,6 +662,26 @@ export default function useBle(activeTab, addLog) {
     setActiveDevice(null);
     setConnectionState('DISCONNECTED');
     setDevices([]);
+    setIsStreaming(false);
+    setWearConfidence(0);
+    setCurrentPacket({
+      activityClass: 'standing',
+      activityConfidence: 1.0,
+      hr: 72,
+      spo2: 98.0,
+      hrv: 45.0,
+      tempC: 24.0,
+      heatIndexF: 75.0,
+      heatIndexTier: 'NORMAL',
+      diagnostic: null,
+      isDirectEscalation: false,
+      anomalyScore: 0.05,
+      peakAccel: 1000,
+      wearConfidence: 0,
+      motionState: 1,
+      motionEmbedding: new Array(32).fill(0),
+    });
+    addLog('Disconnected by user. Threat monitoring reset to IDLE.', 'SYSTEM');
   };
 
   // Writes a single-byte command to the COMMAND characteristic.

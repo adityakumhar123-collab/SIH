@@ -111,19 +111,22 @@ bool VitalSensor::readSample(VitalData& data) {
     irAcEstimate = 0.98f * irAcEstimate + 0.02f * fabsf(irAc);
     redAcEstimate = 0.98f * redAcEstimate + 0.02f * fabsf(redAc);
 
-    // Simple peak detection for Heart Rate (100 Hz)
+    // Dynamic peak detection for Heart Rate (100 Hz) with dicrotic notch suppression
     uint32_t nowMs = millis();
-    if (irAc > 50.0f && irAc > lastFilteredIr && !peakArm) {
-        peakArm = true;
-        if (lastPeakTimeMs > 0) {
-            uint32_t deltaMs = nowMs - lastPeakTimeMs;
-            if (deltaMs >= 300 && deltaMs <= 1500) { // 40 BPM to 200 BPM
-                float instantaneousHr = 60000.0f / (float)deltaMs;
-                calculatedHr = 0.8f * calculatedHr + 0.2f * instantaneousHr;
+    float dynamicThreshold = fmaxf(150.0f, 0.45f * irAcEstimate);
+    if (irAc > dynamicThreshold && irAc > lastFilteredIr && !peakArm) {
+        if (lastPeakTimeMs == 0 || (nowMs - lastPeakTimeMs >= 400)) { // Min 400ms refractory period = Max 150 BPM
+            peakArm = true;
+            if (lastPeakTimeMs > 0) {
+                uint32_t deltaMs = nowMs - lastPeakTimeMs;
+                if (deltaMs >= 400 && deltaMs <= 1500) { // 40 BPM to 150 BPM
+                    float instantaneousHr = 60000.0f / (float)deltaMs;
+                    calculatedHr = 0.85f * calculatedHr + 0.15f * instantaneousHr;
+                }
             }
+            lastPeakTimeMs = nowMs;
         }
-        lastPeakTimeMs = nowMs;
-    } else if (irAc < -20.0f) {
+    } else if (irAc < 0.0f) {
         peakArm = false;
     }
     lastFilteredIr = irAc;

@@ -2,14 +2,38 @@
 // DashboardTab.js — RakshaBand Live Telemetry, Activity & Diagnostic Reasoning UI
 // =============================================================================
 //
-// Key Dashboard Cards:
-// 1. Connection & Peripheral Scanner (SafeBand / RakshaBand ESP32)
-// 2. Real-time Vitals (Heart Rate, SpO2, HRV, Ambient Temp & NOAA Heat Index)
-// 3. Model v3 21-Class Activity Recognition & Confidence Meter
-// 4. Diagnostic Reasoning Engine & Threat Assessment (Gemma 3n Guidance,
-//    Active Hypothesis, Contributing Evidence, Mahalanobis Distance)
-// 5. Live Waveform Graph (Resultant Accel @ 25 Hz)
-// 6. Real-time Diagnostics Terminal
+// DATA FLOW & ARCHITECTURE TRACE:
+// --------------------------------
+// This component is the primary visual interface of RakshaBand. It renders
+// real-time telemetry, machine learning classifications, and clinical AI outputs.
+//
+// HOW DATA REACHES THIS COMPONENT:
+// 1. ESP32 Firmware (esp firmware/src/main.cpp)
+//    - Reads MPU-6050 (100 Hz Motion), MAX30102 (100 Hz Vitals), BMP280 (1 Hz Env)
+//    - Sends BLE Packets: 0x01 (Motion), 0x02 (Status), 0x03 (Env), 0x04 (Vitals)
+// 2. BLE Service & Hook (src/BleService.js & src/hooks/useBle.js)
+//    - Subscribes to GATT characteristics, decodes byte payloads, verifies XOR checksums
+//    - Pushes samples into EpisodeEngine's rolling buffers
+// 3. Episode Engine (src/EpisodeEngine.js)
+//    - Evaluates 200-sample windows (2.0 seconds at 100 Hz, sliding by 50 samples)
+//    - Runs Tier 1/2/3 Feature Extraction & Model v3 21-class cosine classifier
+//    - Computes PPG pulse parameters (Heart Rate, SpO2, HRV) and NOAA Heat Index
+//    - Evaluates MathematicalEngine (Mahalanobis D_M) & DiagnosticReasoningEngine
+// 4. Context Engine (src/ContextEngine.js) & App.js
+//    - Fuses diagnostic hypothesis confidence with Location Familiarity (GPS)
+//    - Produces threatScore (0.00 to 1.00) and threatLevel ('NORMAL'|'ADVISORY'|'CRITICAL')
+//    - App.js passes these as props into DashboardTab.js
+//
+// WHAT EACH UI CARD DISPLAYS & HOW IT IS COMPUTED:
+// - Card 1 (Header): connectionState ('CONNECTED' | 'SCANNING' | 'DISCONNECTED') + batteryPct
+// - Card 2 (Scanner): Discovered peripherals matching "RakshaBand" or SERVICE_UUID
+// - Card 3 (Mini Stats): Uptime (minutes), Location Node ID (GPS cluster), Wear Confidence %
+// - Card 4 (Vitals): Live HR (BPM), SpO2 (%), HRV (RMSSD ms), NOAA Heat Index (°F/°C)
+// - Card 5 (Activity): Model v3 21-class classifier result, confidence bar, peak acceleration
+// - Card 6 (Diagnostic): Fused Threat circular gauge, active primary hypothesis, Gemma 3n guidance,
+//                        expandable clinical evidence drawer with Mahalanobis D_M distance
+// - Card 7 (Waveform): Live IMU resultant acceleration graph (sampled at 25 Hz, throttled to 5 Hz)
+// - Card 8 (Terminal): Real-time event log viewer with category filters (ALL, CONTEXT, SYSTEM)
 // =============================================================================
 
 import React, { useState, useMemo } from 'react';
@@ -25,8 +49,11 @@ import {
 import Svg, { Circle } from 'react-native-svg';
 import styles from './styles';
 import { LocationEngine } from '../LocationEngine.js';
+import SignalsCard from './SignalsCard';
+import LocalSpatialMap from './LocalSpatialMap';
 
 // 21-Class Model v3 Human Activity Metadata
+// Mapped from cosine similarity against class_centroids_v3.json
 const ACTIVITY_META = {
   walking: { label: '🚶 Walking', color: '#3B82F6' },
   walking_slow: { label: '🚶 Slow Walk', color: '#60A5FA' },
@@ -51,7 +78,7 @@ const ACTIVITY_META = {
   shaking_hands: { label: '🤝 Handshake', color: '#38BDF8' },
 };
 
-// NOAA Heat Index Tiers
+// NOAA Heat Index Tiers (Calculated via Rothfusz polynomial regression)
 const HEAT_TIERS = {
   NORMAL: { label: 'Normal', color: '#10B981', bg: 'rgba(16, 185, 129, 0.15)' },
   CAUTION: { label: 'Caution', color: '#FBBF24', bg: 'rgba(251, 191, 36, 0.15)' },
@@ -60,7 +87,7 @@ const HEAT_TIERS = {
   EXTREME_DANGER: { label: 'Extreme Danger', color: '#B91C1C', bg: 'rgba(185, 28, 28, 0.25)' },
 };
 
-// Diagnostic Hypothesis Metadata
+// Diagnostic Hypothesis Metadata (Synthesized by DiagnosticReasoningEngine.js)
 const HYPOTHESIS_META = {
   EXERTION_BENIGN: { label: 'Exertion (Healthy Workout)', color: '#10B981', icon: '🏃' },
   HEAT_STRESS_DEHYDRATION: { label: 'Heat Stress / Dehydration', color: '#F59E0B', icon: '☀️' },
@@ -106,33 +133,44 @@ const DashboardTab = React.memo(({
   threatScore5m = 0.0,
   famFinal = 1.0,
   onTestAlert,
+  userCoords = null,
+  allNodes = [],
+  activeVisit = null,
+  onRenameLocation = null,
 }) => {
   const [showEvidence, setShowEvidence] = useState(false);
 
-  // Derive display values from currentPacket
-  const hr = currentPacket.hr || 72;
-  const spo2 = currentPacket.spo2 !== undefined ? currentPacket.spo2 : 98.0;
+  // ─── Telemetry Extraction & Unit Mapping ──────────────────────────────────
+  // Values are unpacked from currentPacket, which is updated whenever a 2.0s
+  // multi-sensor window completes in EpisodeEngine.js.
+  const hasVitals = currentPacket.hr > 0 && currentPacket.spo2 > 0;
+  const hr = currentPacket.hr || 0;
+  const spo2 = currentPacket.spo2 !== undefined ? currentPacket.spo2 : 0;
   const hrv = currentPacket.hrv || 45.0;
   const tempC = currentPacket.tempC || 24.0;
   const heatF = currentPacket.heatIndexF || 75.0;
   const heatTierKey = currentPacket.heatIndexTier || 'NORMAL';
   const heatMeta = HEAT_TIERS[heatTierKey] || HEAT_TIERS.NORMAL;
 
+  // Activity classification from Model v3 (FeatureExtraction.js classifyEmbedding)
   const activityRaw = (currentPacket.activityClass || 'standing').toLowerCase();
   const activityInfo = ACTIVITY_META[activityRaw] || { label: `Activity: ${activityRaw}`, color: '#60A5FA' };
   const activityConf = currentPacket.activityConfidence !== undefined ? currentPacket.activityConfidence : 1.0;
 
+  // Diagnostic Contract from DiagnosticReasoningEngine.js
   const diag = currentPacket.diagnostic;
   const rawHypo = diag ? diag.primary_hypothesis : (currentPacket.anomalyScore > 0.6 ? 'ANOMALY_UNCLEAR' : 'NORMAL');
   const hypoMeta = HYPOTHESIS_META[rawHypo] || { label: rawHypo, color: '#3B82F6', icon: '🔍' };
 
-  // Vitals Health Classifications
-  const hrStatusColor = hr > 115 ? '#EF4444' : hr > 100 ? '#F59E0B' : hr < 50 ? '#F59E0B' : '#10B981';
-  const hrStatusText = hr > 100 ? 'Elevated' : hr < 50 ? 'Low' : 'Normal';
+  // Vitals Health Status Classifications (NEWS2 Guideline Standards)
+  // Cleanly handles unworn / disconnected states (<= 0) to avoid false "Critical" alarms on table
+  const hrStatusColor = !hasVitals ? '#64748B' : hr > 115 ? '#EF4444' : hr > 100 ? '#F59E0B' : hr < 50 ? '#F59E0B' : '#10B981';
+  const hrStatusText = !hasVitals ? 'Unworn' : hr > 100 ? 'Elevated' : hr < 50 ? 'Low' : 'Normal';
 
-  const spo2StatusColor = spo2 < 90 ? '#EF4444' : spo2 < 94 ? '#F59E0B' : '#10B981';
-  const spo2StatusText = spo2 < 90 ? 'Critical' : spo2 < 94 ? 'Low' : 'Optimal';
+  const spo2StatusColor = !hasVitals ? '#64748B' : spo2 < 90 ? '#EF4444' : spo2 < 94 ? '#F59E0B' : '#10B981';
+  const spo2StatusText = !hasVitals ? 'Unworn' : spo2 < 90 ? 'Critical' : spo2 < 94 ? 'Low' : 'Optimal';
 
+  // Active Location Node derived from LocationEngine.js spatial dwell clustering
   const activeLocation = LocationEngine.activeVisit
     ? `Node #${LocationEngine.activeVisit.location_id || LocationEngine.activeVisit.location_node_id}`
     : 'GPS Tracking';
@@ -239,65 +277,33 @@ const DashboardTab = React.memo(({
         </Text>
       </View>
 
-      {/* ─── 4. Real-time Physiological Vitals Card ────────────────── */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>🫀 Live Physiological Vitals</Text>
+      {/* ─── 4. Live Multi-Modal Signals Card ──────────────────────── */}
+      {/* TRACE: HR, SpO2, HRV, Ambient Temp, Humidity, Barometric Pressure, NOAA Heat Index */}
+      <SignalsCard
+        currentPacket={currentPacket}
+        wearConfidence={wearConfidence}
+        connectionState={connectionState}
+      />
 
-        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10 }}>
-          {/* Heart Rate Tile */}
-          <View style={{ flex: 1, minWidth: '45%', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' }}>
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-              <Text style={{ color: '#94A3B8', fontSize: 11, fontWeight: '600' }}>❤️ HEART RATE</Text>
-              <View style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, backgroundColor: hrStatusColor + '22' }}>
-                <Text style={{ color: hrStatusColor, fontSize: 10, fontWeight: '700' }}>{hrStatusText}</Text>
-              </View>
-            </View>
-            <Text style={{ color: '#FFFFFF', fontSize: 24, fontWeight: 'bold', marginVertical: 4 }}>
-              {hr} <Text style={{ fontSize: 12, color: '#64748B', fontWeight: 'normal' }}>BPM</Text>
-            </Text>
-            <Text style={{ color: '#64748B', fontSize: 10 }}>Baseline: 60 - 100 bpm</Text>
-          </View>
-
-          {/* SpO2 Tile */}
-          <View style={{ flex: 1, minWidth: '45%', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' }}>
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-              <Text style={{ color: '#94A3B8', fontSize: 11, fontWeight: '600' }}>🫁 OXYGEN (SpO2)</Text>
-              <View style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, backgroundColor: spo2StatusColor + '22' }}>
-                <Text style={{ color: spo2StatusColor, fontSize: 10, fontWeight: '700' }}>{spo2StatusText}</Text>
-              </View>
-            </View>
-            <Text style={{ color: '#FFFFFF', fontSize: 24, fontWeight: 'bold', marginVertical: 4 }}>
-              {spo2.toFixed(0)} <Text style={{ fontSize: 12, color: '#64748B', fontWeight: 'normal' }}>%</Text>
-            </Text>
-            <Text style={{ color: '#64748B', fontSize: 10 }}>Target: ≥ 95%</Text>
-          </View>
-
-          {/* HRV Tile */}
-          <View style={{ flex: 1, minWidth: '45%', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' }}>
-            <Text style={{ color: '#94A3B8', fontSize: 11, fontWeight: '600' }}>💓 HRV (RMSSD)</Text>
-            <Text style={{ color: '#FFFFFF', fontSize: 22, fontWeight: 'bold', marginVertical: 4 }}>
-              {hrv.toFixed(0)} <Text style={{ fontSize: 12, color: '#64748B', fontWeight: 'normal' }}>ms</Text>
-            </Text>
-            <Text style={{ color: '#64748B', fontSize: 10 }}>Autonomic resilience</Text>
-          </View>
-
-          {/* NOAA Heat Index & Temp Tile */}
-          <View style={{ flex: 1, minWidth: '45%', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' }}>
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-              <Text style={{ color: '#94A3B8', fontSize: 11, fontWeight: '600' }}>☀️ HEAT INDEX</Text>
-              <View style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, backgroundColor: heatMeta.bg, borderWidth: 1, borderColor: heatMeta.color }}>
-                <Text style={{ color: heatMeta.color, fontSize: 9, fontWeight: '700' }}>{heatMeta.label}</Text>
-              </View>
-            </View>
-            <Text style={{ color: '#FFFFFF', fontSize: 22, fontWeight: 'bold', marginVertical: 4 }}>
-              {heatF.toFixed(0)}°F <Text style={{ fontSize: 12, color: '#64748B', fontWeight: 'normal' }}>({tempC.toFixed(0)}°C)</Text>
-            </Text>
-            <Text style={{ color: '#64748B', fontSize: 10 }}>NOAA Rothfusz Equation</Text>
-          </View>
-        </View>
-      </View>
+      {/* ─── 5. Custom Local Spatial Vector Radar Map (Canvas / SVG) ── */}
+      {/* TRACE: Equirectangular projection tracking user GPS and 5 nearest nodes. */}
+      {/* Tap any node to view last recorded environment, motion, & physiology. */}
+      {/* Tap YOU dot to inspect live real-time conditions. Fullscreen toggle expands to all nodes. */}
+      <LocalSpatialMap
+        userCoords={userCoords}
+        allNodes={allNodes && allNodes.length > 0 ? allNodes : LocationEngine.knownNodes}
+        activeVisit={activeVisit || LocationEngine.activeVisit}
+        currentPacket={currentPacket}
+        wearConfidence={wearConfidence}
+        onRenameLocation={onRenameLocation}
+      />
 
       {/* ─── 5. Model v3 21-Class Activity Recognition ─────────────── */}
+      {/* TRACE: Every 2.0s window (200 samples @ 100 Hz), FeatureExtraction.js extracts */}
+      {/* 90 statistical features (Tier 1), 42 spectral FFT features (Tier 2), and */}
+      {/* 12 covariance eigenvalues (Tier 3), projecting into a 32D unit embedding. */}
+      {/* Cosine dot-product against class_centroids_v3.json selects the activityClass. */}
+      {/* Debounce requires >= 8 of the last 10 windows to confirm an episode transition. */}
       <View style={styles.card}>
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <Text style={styles.cardTitle}>🏃 Real-Time Activity (Model v3)</Text>
@@ -332,6 +338,10 @@ const DashboardTab = React.memo(({
       </View>
 
       {/* ─── 6. Diagnostic Reasoning & Threat Assessment ───────────── */}
+      {/* TRACE: ContextEngine.js fuses DiagnosticReasoningEngine output with GPS familiarity. */}
+      {/* If is_direct_escalation: threatScore = 0.95 (CRITICAL). */}
+      {/* If normal: threatScore = baseScore * (1.2 - 0.4 * familiarityScore). */}
+      {/* Threat Level: NORMAL (<40%), ADVISORY (40-71%), CRITICAL (>=72% -> triggers alert). */}
       <View style={styles.card}>
         <Text style={styles.cardTitle}>🧠 Diagnostic Reasoning Engine</Text>
 
@@ -507,6 +517,13 @@ const DashboardTab = React.memo(({
       </View>
 
       {/* ─── 7. Live Waveform Graph ────────────────────────────────── */}
+      {/* TRACE: Visualizes the 50-point rolling buffer of 3-axis accelerometer data. */}
+      {/* 1. ESP32 transmits 18-byte MOTION packets (0x01) at 100 Hz over BLE. */}
+      {/* 2. useBle.js decodes raw ax, ay, az (mg) and resultant acceleration. */}
+      {/* 3. useBle.js throttles the UI update to 5 Hz (every 200ms) to avoid lagging */}
+      {/*    the React Native rendering thread. */}
+      {/* 4. App.js builds an SVG Path connecting the 50 data points normalized to */}
+      {/*    the screen width, with y=70 representing the 1.0g (1000 mg) resting baseline. */}
       <View style={styles.card}>
         <View style={styles.rowBetween}>
           <Text style={styles.cardTitle}>Live IMU Waveform (25 Hz)</Text>
@@ -525,12 +542,18 @@ const DashboardTab = React.memo(({
           </View>
           <View style={styles.row}>
             <View style={[styles.graphLegendPin, { backgroundColor: 'rgba(239, 68, 68, 0.5)' }]} />
-            <Text style={styles.legendText}>Threshold Boundary</Text>
+            <Text style={styles.legendText}>1.0g Rest Baseline</Text>
           </View>
         </View>
       </View>
 
       {/* ─── 8. Diagnostics Terminal ───────────────────────────────── */}
+      {/* TRACE: Real-time on-device audit log displaying streaming telemetry, */}
+      {/* inference engine evaluations, and system events. */}
+      {/* - SYSTEM: BLE connection status, battery changes, MTU negotiation */}
+      {/* - CONTEXT: ContextEngine threat score calculations, hypothesis shifts, and */}
+      {/*   location familiarity score changes. Only logs if threat score shifts >= 2%. */}
+      {/* Logs are held in logsHistoryRef (max 250 entries) and sliced for display. */}
       <View style={styles.terminalCard}>
         <TouchableOpacity
           delayPressIn={0}

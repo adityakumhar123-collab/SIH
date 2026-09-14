@@ -111,10 +111,8 @@ bool IMUSensor::readSample(IMUData& data) {
         }
     }
 
-    // Convert accelerometer from g to m/s^2 to match training dataset scale (ax_ms2)
-    data.ax *= 9.80665f;
-    data.ay *= 9.80665f;
-    data.az *= 9.80665f;
+    // IMU accelerometer readings are kept in units of g (e.g. 1.0g at rest)
+    // as specified in IMUSensor.h and expected by EdgeAnalytics and BLEManager (which scales by 1000 to mg).
 
     return true;
 }

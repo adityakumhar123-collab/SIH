@@ -29,6 +29,7 @@ class LocationEngineClass {
     this.activeVisit = null;
     this.knownNodes = [];
     this.candidateDwell = null;
+    this.nodeEventListener = null;
 
     // Parameters
     this.ENTRY_RADIUS = 25.0; // meters
@@ -36,6 +37,20 @@ class LocationEngineClass {
     this.CANDIDATE_RADIUS = 40.0; // meters wander tolerance
     this.MIN_STAY_DURATION = 5 * 60 * 1000; // 5 minutes in ms
     this.MAX_ALLOWED_ACCURACY = 30.0; // meters (accuracy gating)
+  }
+
+  setNodeEventListener(listener) {
+    this.nodeEventListener = listener;
+  }
+
+  notifyEventListener(event) {
+    if (typeof this.nodeEventListener === 'function') {
+      try {
+        this.nodeEventListener(event);
+      } catch (err) {
+        console.warn('[LocationEngine] Error in node event listener:', err);
+      }
+    }
   }
 
   initialize(minStayDurationMs = null) {
@@ -130,6 +145,15 @@ class LocationEngineClass {
       } else {
         this.updateVisitDuration();
       }
+
+      // If this node is unnamed or has 'null' name, notify naming listener
+      const isUnnamed = !matchedNode.name || matchedNode.name === 'null' || matchedNode.name === 'undefined' || String(matchedNode.name).trim() === '';
+      if (isUnnamed) {
+        this.notifyEventListener({
+          type: 'UNNAMED_NODE_ENTERED',
+          node: matchedNode
+        });
+      }
     } else {
       if (this.activeVisit) {
         this.closeVisit(vitalsContext);
@@ -138,13 +162,16 @@ class LocationEngineClass {
     }
   }
 
-  startVisit(locationId) {
+  startVisit(locationId, customLat = null, customLon = null) {
+    const entryLat = customLat ?? this.currentGps?.latitude ?? 12.9716;
+    const entryLon = customLon ?? this.currentGps?.longitude ?? 77.5946;
+    const entryAcc = this.currentGps?.accuracy ?? 10.0;
     const visit = {
       location_id: locationId,
       enter_timestamp: Date.now(),
-      entry_latitude: this.currentGps.latitude,
-      entry_longitude: this.currentGps.longitude,
-      entry_accuracy: this.currentGps.accuracy
+      entry_latitude: entryLat,
+      entry_longitude: entryLon,
+      entry_accuracy: entryAcc
     };
 
     try {
@@ -267,9 +294,8 @@ class LocationEngineClass {
       const centroidLat = sumLat / samples.length;
       const centroidLon = sumLon / samples.length;
 
-      const nodeCount = this.knownNodes.length + 1;
       const newNode = {
-        name: `Location #${nodeCount}`,
+        name: null, // Null by default; user is prompted to provide a friendly name
         center_latitude: centroidLat,
         center_longitude: centroidLon,
         entry_radius: this.ENTRY_RADIUS,
@@ -287,6 +313,10 @@ class LocationEngineClass {
         this.candidateDwell = null;
         this.refreshNodes();
         this.startVisit(newId);
+        this.notifyEventListener({
+          type: 'NEW_NODE_CREATED',
+          node: { ...newNode, location_id: newId }
+        });
       } catch (e) {
         console.warn('[LocationEngine] Failed to save candidate as new node:', e);
       }
@@ -375,9 +405,8 @@ class LocationEngineClass {
       }
     }
 
-    const nodeCount = this.knownNodes.length + 1;
     const newNode = {
-      name: name || `Location #${nodeCount}`,
+      name: name || null,
       center_latitude: lat,
       center_longitude: lon,
       entry_radius: this.ENTRY_RADIUS,
@@ -392,8 +421,53 @@ class LocationEngineClass {
     const newId = saveKnownLocation(newNode);
     this.candidateDwell = null;
     this.refreshNodes();
-    this.startVisit(newId);
+    this.startVisit(newId, lat, lon);
+    if (!name) {
+      this.notifyEventListener({
+        type: 'NEW_NODE_CREATED',
+        node: { ...newNode, location_id: newId }
+      });
+    }
     return newId;
+  }
+
+  /**
+   * Computes distance from current or provided GPS coordinates to all known location nodes.
+   * Returns nodes augmented with dx (meters east), dy (meters south), and distMeters,
+   * sorted ascending by proximity.
+   *
+   * @param {number|null} [limit=5] - Number of nodes to return (pass null for all)
+   * @param {number|null} [userLat=null] - Optional override latitude
+   * @param {number|null} [userLon=null] - Optional override longitude
+   * @returns {Array<Object>} Sorted array of augmented location nodes
+   */
+  getNearestNodes(limit = 5, userLat = null, userLon = null) {
+    const lat = userLat ?? this.currentGps?.latitude ?? 12.9716;
+    const lon = userLon ?? this.currentGps?.longitude ?? 77.5946;
+
+    const toRad = (x) => (x * Math.PI) / 180.0;
+    const cosLat = Math.cos(toRad(lat));
+
+    const augmented = this.knownNodes.map((node) => {
+      const nLat = node.center_latitude !== undefined ? node.center_latitude : node.latitude;
+      const nLon = node.center_longitude !== undefined ? node.center_longitude : node.longitude;
+
+      // Local flat-earth projection offsets in meters
+      const dx = (nLon - lon) * cosLat * 111320.0;
+      const dy = -(nLat - lat) * 110540.0; // Negative because screen Y increases downward
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      return {
+        ...node,
+        dx,
+        dy,
+        distMeters: Math.round(dist * 10) / 10
+      };
+    });
+
+    augmented.sort((a, b) => a.distMeters - b.distMeters);
+
+    return limit !== null ? augmented.slice(0, limit) : augmented;
   }
 
   getHaversineDistance(lat1, lon1, lat2, lon2) {

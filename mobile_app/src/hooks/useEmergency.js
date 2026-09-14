@@ -116,7 +116,9 @@ function base64Encode(str) {
   return result;
 }
 
-import { logEscalation } from '../Database.js';
+import { logEscalation, saveUserFeedback } from '../Database.js';
+import { EpisodeEngine } from '../EpisodeEngine.js';
+import { LocationEngine } from '../LocationEngine.js';
 
 // Substitutes template placeholders with actual incident data.
 function compileTemplate(templateContent, data) {
@@ -280,11 +282,20 @@ export default function useEmergency({
   // =============================================================================
   const executeEmergencyDispatch = async (isDuress = false) => {
     clearInterval(alertIntervalRef.current); // Stop the countdown
-    setIsDispatched(true);                   // Switches modal to "Dispatching..." state
     setBeepingFlash(false);
-    if (dbSettingsRef.current.silent_beacon !== '1') {
-      // 3-pulse vibration pattern: 100ms on, 500ms off, 100ms on, 500ms off
-      Vibration.vibrate([100, 500, 100, 500]);
+
+    if (isDuress) {
+      // In duress mode, immediately hide modal and appear as if cancelled to protect user from aggressor
+      setShowAlertModal(false);
+      setPinEntryMode(false);
+      setEnteredPin('');
+      setPinError(null);
+    } else {
+      setIsDispatched(true); // Switches modal to "Dispatching..." state
+      if (dbSettingsRef.current.silent_beacon !== '1') {
+        // 3-pulse vibration pattern: 100ms on, 500ms off, 100ms on, 500ms off
+        Vibration.vibrate([100, 500, 100, 500]);
+      }
     }
     
     addLog(`Emergency alert dispatched! ${isDuress ? '(DURESS MODE)' : '(NORMAL MODE)'}`, 'SYSTEM');
@@ -667,9 +678,11 @@ export default function useEmergency({
       await sendBleCommand(0x04); // 0x04 = Acknowledge the alert (clear alert flag)
     }
 
-    // Reset currentPacket to calm "normal walking" values to clear the dashboard.
-    // The real device will overwrite these within 500ms on the next FEATURE packet.
-    setCurrentPacket({
+    // Reset currentPacket to calm "normal" state while preserving telemetry fields (HR, SpO2, activity)
+    setCurrentPacket((prev) => ({
+      ...prev,
+      diagnostic: null,
+      isDirectEscalation: false,
       anomalyScore: 0.0884,
       anomalyDuration: 0,
       motionState: (1 << 1), // Periodic walking (normal state)
@@ -679,14 +692,30 @@ export default function useEmergency({
       zcr: 30,
       spectralEntropy: 110,
       wearConfidence: wearConfidenceRef.current, // Preserve actual wear confidence
-    });
+    }));
 
-    addLog('Alert cancelled by user. Packet metrics reset to NORMAL. Cooldown started (20s).', 'SYSTEM');
+    // Reset EpisodeEngine anomaly persistence and record user dismissal feedback
+    EpisodeEngine.resetAnomalyPersistence();
+    if (currentPacketRef.current?.diagnostic?.event_id) {
+      try {
+        saveUserFeedback({
+          event_id: currentPacketRef.current.diagnostic.event_id,
+          location_id: LocationEngine.activeVisit ? LocationEngine.activeVisit.location_id : null,
+          user_action: 'DISMISSED',
+          notes: 'User dismissed emergency countdown',
+          prior_adjustment_applied: true
+        });
+      } catch (e) {
+        // ignore DB feedback error during emergency cancel
+      }
+    }
 
-    // Start 20-second cooldown: prevents ContextEngine from re-triggering immediately
+    addLog('Alert cancelled by user. Packet metrics reset to NORMAL. Cooldown started (60s).', 'SYSTEM');
+
+    // Start 60-second cooldown: prevents ContextEngine from re-triggering immediately
     cooldownActiveRef.current = true;
     setCooldownActive(true);
-    setCooldownTime(20);
+    setCooldownTime(60);
 
     const timer = setInterval(() => {
       setCooldownTime((prev) => {
@@ -704,11 +733,12 @@ export default function useEmergency({
 
   return {
     showAlertModal,          // Whether the emergency alert overlay is visible
+    setShowAlertModal,       // Modal visibility control
     alertCountdown,          // Seconds remaining until auto-dispatch
     isDispatched,            // True once dispatch has been triggered
     beepingFlash,            // Alternates for pulsing red animation
     dispatchStatuses,        // Per-contact, per-channel dispatch status array
-    cooldownActive,          // True during 20s post-cancel cooldown
+    cooldownActive,          // True during cooldown post-cancel
     cooldownActiveRef,       // Ref version of cooldownActive (for interval closures)
     cooldownTime,            // Seconds remaining in cooldown
     pinEntryMode,            // True when PIN input is shown in modal

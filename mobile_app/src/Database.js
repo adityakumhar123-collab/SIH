@@ -124,7 +124,7 @@ export function initDatabase() {
     database.execSync(`
       CREATE TABLE IF NOT EXISTS known_locations (
         location_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
+        name TEXT,
         center_latitude REAL NOT NULL,
         center_longitude REAL NOT NULL,
         entry_radius REAL DEFAULT 25.0,
@@ -454,7 +454,11 @@ export function getKnownLocation(id) {
 
 export function saveKnownLocation(node) {
   const database = initDatabase();
-  const name = node.name || node.label || 'Learned Place';
+  // Cleanly store null if name is unset, 'null', or whitespace
+  const rawName = node.name !== undefined ? node.name : node.label;
+  const name = (rawName && rawName !== 'null' && rawName !== 'undefined' && String(rawName).trim() !== '')
+    ? String(rawName).trim()
+    : null;
   const lat = node.center_latitude !== undefined ? node.center_latitude : node.latitude;
   const lon = node.center_longitude !== undefined ? node.center_longitude : node.longitude;
   const entryRadius = node.entry_radius || node.radius_meters || 25.0;
@@ -510,7 +514,68 @@ export function saveKnownLocation(node) {
 
 export function updateLocationName(locationId, name) {
   const database = initDatabase();
-  database.runSync('UPDATE known_locations SET name = ? WHERE location_id = ?;', [name, locationId]);
+  const cleanName = (name && name !== 'null' && name !== 'undefined' && String(name).trim() !== '')
+    ? String(name).trim()
+    : null;
+  database.runSync('UPDATE known_locations SET name = ? WHERE location_id = ?;', [cleanName, locationId]);
+}
+
+/**
+ * Returns a user-friendly display name for a location node, guaranteeing
+ * that literal 'null', 'Location null', or blank names are never shown.
+ *
+ * @param {Object|string} nodeOrName
+ * @param {number|string} [fallbackId]
+ * @returns {string} Clean label, e.g. "Home", "Office", or "Zone #2"
+ */
+export function getCleanLocationName(nodeOrName, fallbackId = null) {
+  if (!nodeOrName) {
+    return fallbackId ? `Zone #${fallbackId}` : 'Zone';
+  }
+  if (typeof nodeOrName === 'object') {
+    const raw = nodeOrName.name;
+    const id = nodeOrName.location_id || nodeOrName.id || fallbackId;
+    if (raw && raw !== 'null' && raw !== 'undefined' && String(raw).trim() !== '') {
+      return String(raw).trim();
+    }
+    return id ? `Zone #${id}` : 'Zone';
+  }
+  const str = String(nodeOrName).trim();
+  if (str === 'null' || str === 'undefined' || str === '') {
+    return fallbackId ? `Zone #${fallbackId}` : 'Zone';
+  }
+  return str;
+}
+
+/**
+ * Queries the last stored historical telemetry recorded at a specific location node:
+ * - Environment (temperature, humidity, pressure, heat index)
+ * - Motion state / activity classification
+ * - Physiological condition (resting HR, SpO2, HRV)
+ *
+ * @param {number} locationId
+ * @returns {Object|null} { node, lastEpisode, lastVisit }
+ */
+export function getLocationHistoricalData(locationId) {
+  const database = initDatabase();
+  const node = database.getFirstSync('SELECT * FROM known_locations WHERE location_id = ?;', [locationId]);
+  if (!node) return null;
+
+  const lastEpisode = database.getFirstSync(
+    'SELECT * FROM episodes WHERE location_id = ? ORDER BY start_timestamp DESC LIMIT 1;',
+    [locationId]
+  );
+
+  const lastVisit = database.getFirstSync(
+    'SELECT * FROM location_visits WHERE location_id = ? ORDER BY enter_timestamp DESC LIMIT 1;',
+    [locationId]
+  );
+
+  return {
+    node,
+    lastEpisode: lastEpisode || null,
+    lastVisit: lastVisit || null
+  };
 }
 
 export function saveLocationVisit(visit) {

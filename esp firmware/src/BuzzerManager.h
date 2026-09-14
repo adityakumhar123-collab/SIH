@@ -26,10 +26,11 @@ private:
     BuzzerManager(const BuzzerManager&) = delete;
     BuzzerManager& operator=(const BuzzerManager&) = delete;
 
-    uint8_t buzzerPin;
+    int8_t buzzerPin;
     AlertPattern currentPattern;
     uint8_t stepIndex;
     uint32_t stepEndTimeMs;
+    uint32_t lastAlertTriggerTimeMs;
     bool isPlaying;
 
     void setBuzzerState(bool on);

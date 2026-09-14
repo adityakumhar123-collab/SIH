@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, TouchableOpacity, ScrollView, Alert, ActivityIndicator, Platform } from 'react-native';
 import styles from './styles';
-import { executeSql, executeRun } from '../Database';
+import { executeSql, executeRun, getCleanLocationName } from '../Database';
 import { LocationEngine } from '../LocationEngine';
 
 const TABLE_METADATA = {
@@ -18,7 +18,7 @@ const TABLE_METADATA = {
   known_locations: {
     label: 'Known Locations',
     pk: 'location_id',
-    formatRow: (row) => `Location #${row.location_id}: ${row.name || 'Saved Place'} • Dwells: ${row.dwell_count || 1} • Total Stay: ${row.total_stay_minutes || 0}m`
+    formatRow: (row) => `Location #${row.location_id}: ${getCleanLocationName(row)} • Dwells: ${row.dwell_count || 1} • Total Stay: ${row.total_stay_minutes || 0}m`
   },
   location_visits: {
     label: 'Location Visits',

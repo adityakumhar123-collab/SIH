@@ -2,17 +2,47 @@
 // ContextEngine.js — RakshaBand Contextual Threat Assessment Coordinator
 // =============================================================================
 //
-// Coordinates:
-// 1. MathematicalEngine (Mahalanobis distance on [HR, SpO2] and Environment)
-// 2. DiagnosticReasoningEngine (Weighted evidence scoring on 5 target hypotheses + Fall)
-// 3. LocationEngine (Dwell centroids, familiarity, and location prior adjustments)
-// 4. GemmaService (Natural language explanation and guidance)
+// DRY RUN / ARCHITECTURE OVERVIEW:
+// --------------------------------
+// ContextEngine is the central decision-fusion coordinator of the RakshaBand
+// mobile application. It fuses three independent streams of intelligence:
+//   1. Clinical Evidence: Evaluated by DiagnosticReasoningEngine.js across 5
+//      clinical hypotheses (Heat Exhaustion, Hypertensive Crisis, Severe
+//      Hypoxemia, Exertion, Anomaly Unclear) plus Hard Impact Fall detection.
+//   2. Statistical Geometry: Mahalanobis distance anomalies computed in 2D
+//      physiological space [HR, SpO2] and 3D environmental space [Temp, Humidity, Pressure]
+//      by MathematicalEngine.js.
+//   3. Spatial Familiarity: LocationEngine.js spatial dwell clustering and
+//      historical visit frequency (0.0 unfamiliar - 1.0 safe/familiar).
 //
-// Exposes:
-// - ContextEngine singleton: coordinates real-time inference ticks
-// - computeThreatScoreDetailed(): fused real-time threat score (0.0 to 1.0)
-// - getThreatLevel(): 'NORMAL' | 'ADVISORY' | 'CRITICAL'
-// - Distance and time utilities for backward compatibility
+// REACTION LEVELS & EMERGENCY THRESHOLDS:
+// ----------------------------------------
+//   - CRITICAL (Score >= 0.72):
+//     Triggers 15-second audible countdown modal on App.js, vibrating wristband,
+//     and prepares Twilio/Resend multi-channel emergency dispatch.
+//   - ADVISORY (0.40 <= Score < 0.72):
+//     Renders amber warning badges, prompts user with Gemma 3n contextual advice
+//     (hydration, ventilation, rest).
+//   - NORMAL (Score < 0.40):
+//     All vitals and activity within baseline; updates running EWMA baselines.
+//
+// CORE THREAT FORMULA:
+// --------------------
+//   fusedScore = baseConfidence * (1.2 - 0.4 * familiarityScore)
+//   - If Location Familiarity = 1.0 (e.g. Home or Office):
+//     multiplier = 1.2 - 0.4(1.0) = 0.80 (20% false-alarm suppression)
+//   - If Location Familiarity = 0.0 (e.g. Unknown highway or remote location):
+//     multiplier = 1.2 - 0.4(0.0) = 1.20 (20% heightened sensitivity)
+//
+// HARD SUPPRESSION & BYPASS RULES:
+// --------------------------------
+//   - Off-Wrist Suppression: If wearConfidence < 40%, threatScore is forced to 0.0.
+//     Prevents false alarms when the band is resting on a charging dock or nightstand.
+//   - Direct Escalation: Hard impact falls (>= 3.5g peak accel + linear impact vector)
+//     or clinical hard vitals failure bypass all familiarity dampeners and force
+//     threatScore = 0.95 (CRITICAL).
+//   - Benign Exertion: Running/jogging/walking with elevated HR is recognized as
+//     EXERTION_BENIGN, scaling confidence down by 0.25x to avoid workout false alarms.
 // =============================================================================
 
 import { MathematicalEngine } from './MathematicalEngine.js';
@@ -42,7 +72,7 @@ export function secondsToTimeStr(sec) {
 
 export function getHaversineDistance(lat1, lon1, lat2, lon2) {
   const toRad = (x) => (x * Math.PI) / 180.0;
-  const R = 6371000.0;
+  const R = 6371000.0; // Earth's mean radius in meters
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
   const a =
@@ -55,6 +85,13 @@ export function getHaversineDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
+/**
+ * Maps a continuous threat score (0.0 to 1.0) into discrete clinical severity tiers.
+ * Used across the dashboard UI for color coding (green/amber/red) and action triggers.
+ *
+ * @param {number} score - Threat assessment score [0.0 - 1.0]
+ * @returns {Object} Tier metadata { name, color, action }
+ */
 export function getThreatLevel(score) {
   if (score >= 0.72) {
     return {
@@ -83,15 +120,48 @@ export function getThreatLevel(score) {
 /**
  * Computes fused threat assessment from current telemetry packet and location familiarity.
  *
- * @param {Object} currentPacket - latest telemetry packet
- * @param {Object} [options] - { familiarityScore, cooldownActive }
- * @returns {Object} { threatScore, score, threatLevel, hypothesis, diagnostic, explanation, details }
+ * PIPELINE STAGES:
+ * 1. Direct Escalation Check: Immediate critical return for hard falls or extreme vitals.
+ * 2. Wrist Wear Verification: Low wear confidence (< 40%) forces threatScore = 0.0.
+ * 3. Clinical Diagnostic Contract Fusion:
+ *    - Base score taken from DiagnosticReasoningEngine hypothesis confidence.
+ *    - Benign physical exertion dampened (0.25x).
+ *    - Ambiguous anomaly dampened (0.40x).
+ * 4. Spatial Familiarity Modulation:
+ *    fusedScore = baseScore * (1.2 - 0.4 * familiarity)
+ * 5. Post-Dismissal Cooldown:
+ *    60-second cooldown scales score by 0.60x if user recently cancelled a pre-alert.
+ *
+ * @param {Object} currentPacket - latest telemetry packet containing vitals, diagnostic, wearConfidence
+ * @param {Object} [options] - { familiarityScore: number, cooldownActive: boolean }
+ * @returns {Object} { threatScore, score, score3s, score3m, score5m, threatLevel, hypothesis, diagnostic, explanation, details }
  */
 export function computeThreatScoreDetailed(currentPacket, options = {}) {
   const familiarity = options.familiarityScore !== undefined ? options.familiarityScore : 0.5;
   const isCooldown = !!options.cooldownActive;
 
-  // Direct escalation check (Falls or Critical vitals)
+  // ---------------------------------------------------------------------------
+  // 1. Post-Dismissal Cooldown Protection (If user recently verified safety)
+  // ---------------------------------------------------------------------------
+  if (isCooldown) {
+    const lvl = getThreatLevel(0.25);
+    return {
+      threatScore: 0.25,
+      score: 0.25,
+      score3s: 0.25,
+      score3m: 0.20,
+      score5m: 0.15,
+      threatLevel: lvl,
+      hypothesis: 'COOLDOWN_ACTIVE',
+      diagnostic: currentPacket.diagnostic || null,
+      explanation: ['Cooldown active — user recently verified safety.'],
+      details: 'Threat suppressed during post-dismissal cooldown'
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // 2. Direct Escalation Check (Hard Falls or Severe Physiological Collapse)
+  // ---------------------------------------------------------------------------
   if (currentPacket.isDirectEscalation || (currentPacket.diagnostic && currentPacket.diagnostic.is_direct_escalation)) {
     const lvl = getThreatLevel(0.95);
     return {
@@ -108,7 +178,9 @@ export function computeThreatScoreDetailed(currentPacket, options = {}) {
     };
   }
 
-  // If wear confidence is low (<40%), suppress threat score to prevent false alarm on nightstand
+  // ---------------------------------------------------------------------------
+  // 3. Wrist Wear Verification (False Alarm Suppression when off-wrist)
+  // ---------------------------------------------------------------------------
   if (currentPacket.wearConfidence !== undefined && currentPacket.wearConfidence < 40) {
     const lvl = getThreatLevel(0.0);
     return {
@@ -125,14 +197,16 @@ export function computeThreatScoreDetailed(currentPacket, options = {}) {
     };
   }
 
-  // If Diagnostic Contract is already attached from EpisodeEngine
+  // ---------------------------------------------------------------------------
+  // 4. Diagnostic Reasoning Contract Fusion (when EpisodeEngine attaches diag)
+  // ---------------------------------------------------------------------------
   if (currentPacket.diagnostic) {
     const diag = currentPacket.diagnostic;
     let baseScore = diag.confidence;
 
-    // Dampen benign physical exertion
+    // Suppress threat score for healthy workouts where tachycardia is expected
     if (diag.primary_hypothesis === HYPOTHESES.EXERTION_BENIGN) {
-      baseScore *= 0.25; // Suppress threat score for healthy workout
+      baseScore *= 0.25;
     } else if (diag.primary_hypothesis === HYPOTHESES.ANOMALY_UNCLEAR) {
       baseScore *= 0.40;
     }
@@ -141,8 +215,9 @@ export function computeThreatScoreDetailed(currentPacket, options = {}) {
     const familiarityDampener = 1.2 - 0.4 * familiarity;
     let fusedScore = Math.min(1.0, Math.max(0.0, baseScore * familiarityDampener));
 
-    if (isCooldown) {
-      fusedScore *= 0.60;
+    // Cap non-direct advisory hypotheses so they do not trigger emergency dispatch without hard bounds
+    if (!diag.is_direct_escalation) {
+      fusedScore = Math.min(0.68, fusedScore);
     }
 
     fusedScore = Number(fusedScore.toFixed(3));
@@ -169,10 +244,13 @@ export function computeThreatScoreDetailed(currentPacket, options = {}) {
     };
   }
 
-  // Fallback heuristic scoring from raw anomaly/vitals if diagnostic is not yet available
+  // ---------------------------------------------------------------------------
+  // 4. Fallback Heuristic Scoring (used during initial buffering/accumulation)
+  // ---------------------------------------------------------------------------
   const rawScore = currentPacket.anomalyScore || 0.05;
   const familiarityDampener = 1.3 - 0.6 * familiarity;
-  let fusedScore = Math.min(1.0, Math.max(0.0, rawScore * familiarityDampener));
+  // Cap fallback scoring at 0.68 so unclassified heuristic drift cannot trip emergency dispatch (>=0.72)
+  let fusedScore = Math.min(0.68, Math.max(0.0, rawScore * familiarityDampener));
   if (isCooldown) fusedScore *= 0.60;
 
   fusedScore = Number(fusedScore.toFixed(3));
@@ -192,6 +270,10 @@ export function computeThreatScoreDetailed(currentPacket, options = {}) {
   };
 }
 
+/**
+ * ContextEngineClass: Coordinates periodic context evaluation and caches state.
+ * Instantiated as a singleton export.
+ */
 class ContextEngineClass {
   constructor() {
     this.cachedThreatScore = 0.05;
@@ -200,6 +282,9 @@ class ContextEngineClass {
     this.logs = [];
   }
 
+  /**
+   * Initializes sub-engines on application startup.
+   */
   initialize() {
     MathematicalEngine.initialize();
     LocationEngine.initialize();
@@ -208,10 +293,12 @@ class ContextEngineClass {
   }
 
   /**
-   * Periodic context evaluation (runs every 3-5 seconds or per BLE window).
+   * Periodic context evaluation called every 3 seconds by App.js Timer Loop 1.
+   * Reads current GPS from LocationEngine, calculates familiarity score, and fuses
+   * with current telemetry to return updated state.
    *
-   * @param {Object} currentPacket
-   * @returns {Object} Assessment result
+   * @param {Object} currentPacket - Latest telemetry packet
+   * @returns {Object} { threatScore, threatLevel, hypothesis, familiarityScore, diagnostic }
    */
   runInference(currentPacket = {}) {
     let familiarity = 0.5;

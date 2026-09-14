@@ -2,14 +2,41 @@
 // EpisodeEngine.js — Multi-Sensor Continuity Segmentation & Inference Orchestrator
 // =============================================================================
 //
-// RakshaBand Episode Engine:
-// 1. Buffers raw 100 Hz IMU data into 200-sample windows (stride = 50 samples = 2 Hz)
-// 2. Extracts Tier 1 (90 stats), Tier 2 (42 spectral), Tier 3 (12 covariance) features
-// 3. Generates 32D unit embeddings and classifies against 21 class centroids
-// 4. Extracts PPG vitals (Heart Rate, SpO2, HRV) and NOAA Heat Index
-// 5. Applies 10-window debounce boundary rule (>= 8 new class = transition)
-// 6. Persists continuous multi-sensor episodes to SQLite (`episodes` table)
-// 7. Evaluates Mathematical Engine & Diagnostic Reasoning Engine on each inference tick
+// DRY RUN / ARCHITECTURE OVERVIEW:
+// --------------------------------
+// EpisodeEngine is the real-time sensor ingestion and time-series feature pipeline.
+// It transforms high-rate raw sensor streams into continuous human activity episodes,
+// physiological vitals, and diagnostic evidence packets.
+//
+// SENSOR INGESTION & BUFFER SIZING:
+// ---------------------------------
+// - Motion: Ingests 6-DoF IMU [ax, ay, az, gx, gy, gz] samples at 100 Hz via pushMotionSample().
+// - Photoplethysmography (PPG): Ingests raw Red and Infrared optical sensor counts at 100 Hz.
+// - Environmental: Ingests ambient Temperature (°C), Relative Humidity (%), and Pressure (hPa) at 1 Hz.
+//
+// SLIDING WINDOW & STRIDE MATH:
+// -----------------------------
+// - WINDOW_SIZE = 200 samples (2.0 seconds at 100 Hz)
+// - STRIDE_SIZE = 50 samples (0.5 seconds at 100 Hz -> 2.0 Hz inference rate)
+// - Every 500ms, the oldest 50 samples slide out, and processWindow() is invoked.
+//
+// MODEL V3 21-CLASS ACTIVITY RECOGNITION:
+// ---------------------------------------
+// 1. extractWindowFeatures(): Computes 144 features:
+//    - Tier 1: 90 statistical features (Mean, Std, Min, Max, RMS, Zero-Crossings, Jerk)
+//    - Tier 2: 42 spectral features (FFT dominant frequency, spectral energy, spectral entropy)
+//    - Tier 3: 12 covariance eigenvalues (Linearity, Planarity, Spherical dispersion)
+// 2. standardizeFeatures(): Normalizes features using z-score scalers from model_v3.json.
+// 3. generateFallbackEmbedding(): Projects 144 normalized features into a 32D unit hypersphere.
+// 4. classifyEmbedding(): Evaluates cosine dot-product against 21 class centroids,
+//    selecting the class with maximum cosine similarity.
+//
+// DEBOUNCING & EPISODE PERSISTENCE:
+// ---------------------------------
+// - To prevent rapid flickering during transient motion, a 10-window majority rule is used.
+// - An activity transition is only committed if >= 8 of the last 10 windows classify as the new class.
+// - Continuous episodes are saved into SQLite (`episodes` table) with duration, aggregate means,
+//   and min/max physiological markers.
 // =============================================================================
 
 import {
@@ -33,16 +60,16 @@ import { LocationEngine } from './LocationEngine.js';
 class EpisodeEngineClass {
   constructor() {
     this.activeEpisode = null;
-    this.imuBuffer = [];       // Array of [ax, ay, az, gx, gy, gz] samples
+    this.imuBuffer = [];       // Array of [ax, ay, az, gx, gy, gz] samples (100 Hz)
     this.redBuffer = [];       // Raw Red channel samples (100 Hz)
     this.irBuffer = [];        // Raw IR channel samples (100 Hz)
     this.latestEnv = { tempC: 24.0, pressHpa: 1013.25, humPct: 50.0 };
 
-    this.WINDOW_SIZE = 200;    // 2.0s at 100 Hz
-    this.STRIDE_SIZE = 50;     // 0.5s stride = 2.0 Hz tick
-    this.classificationHistory = []; // Last 10 activity classifications for debounce
+    this.WINDOW_SIZE = 200;    // 2.0s window @ 100 Hz
+    this.STRIDE_SIZE = 50;     // 0.5s stride @ 100 Hz = 2.0 Hz inference tick
+    this.classificationHistory = []; // Rolling FIFO of last 10 classifications for debounce
 
-    // Running physiological & environmental telemetry accumulators
+    // Running physiological & environmental telemetry accumulators for open episode
     this.sampleCounts = 0;
     this.hrAccumulator = [];
     this.spo2Accumulator = [];
@@ -50,7 +77,7 @@ class EpisodeEngineClass {
     this.heatIndexAccumulator = [];
     this.accelRmsAccumulator = [];
 
-    // Current real-time state exposed to UI
+    // Current real-time state exposed to UI and ContextEngine
     this.currentVitals = { hr: 72, spo2: 98.0, hrv: 45.0 };
     this.currentHeatIndex = { heatIndexF: 75.0, tier: 'NORMAL', riskLevel: 0 };
     this.currentActivity = { activityClass: 'standing', confidence: 1.0 };
@@ -90,6 +117,14 @@ class EpisodeEngineClass {
     }
   }
 
+  /**
+   * Resets anomaly persistence timer, called when user verifies safety / cancels alert.
+   */
+  resetAnomalyPersistence() {
+    this.anomalyStartTimestamp = 0;
+    this.anomalyPersistenceMinutes = 0;
+  }
+
   // Ingest raw 100 Hz Motion Sample [ax, ay, az, gx, gy, gz]
   pushMotionSample(sample) {
     this.imuBuffer.push(sample);
@@ -102,7 +137,7 @@ class EpisodeEngineClass {
   pushVitalSample(red, ir) {
     this.redBuffer.push(red);
     this.irBuffer.push(ir);
-    if (this.redBuffer.length > 200) {
+    if (this.redBuffer.length > 400) {
       this.redBuffer.shift();
       this.irBuffer.shift();
     }
@@ -114,9 +149,11 @@ class EpisodeEngineClass {
   }
 
   /**
-   * Evaluates the sliding window if 200 samples have accumulated.
+   * Evaluates the sliding window when 200 samples have accumulated.
    * Runs feature extraction, Model v3 inference, debouncing, and reasoning.
    * Returns complete telemetry packet or null if accumulating.
+   *
+   * @returns {Object|null} Telemetry packet containing activity, vitals, diagnostic contract, and peak accel
    */
   processWindow() {
     if (this.imuBuffer.length < this.WINDOW_SIZE) {
@@ -124,9 +161,9 @@ class EpisodeEngineClass {
     }
 
     const window = this.imuBuffer.slice(0, this.WINDOW_SIZE);
-    this.imuBuffer.splice(0, this.STRIDE_SIZE); // Slide by 50 samples (0.5s)
+    this.imuBuffer.splice(0, this.STRIDE_SIZE); // Slide by 50 samples (0.5s = 2 Hz tick)
 
-    // 1. Feature Extraction (Tier 1, 2, 3)
+    // 1. Feature Extraction: Tier 1 (Stats), Tier 2 (Spectral FFT), Tier 3 (Covariance Eigenvalues)
     let seqRaw, globRaw;
     try {
       const feats = extractWindowFeatures(window);
@@ -137,21 +174,21 @@ class EpisodeEngineClass {
       return null;
     }
 
-    // 2. Standardization & 32D Unit Embedding
+    // 2. Feature Standardization & 32D Unit Embedding Projection
     const { seqNorm, globNorm } = standardizeFeatures(seqRaw, globRaw);
     const embedding = generateFallbackEmbedding(seqNorm, globNorm);
 
-    // 3. 21-Class Cosine Activity Classification
+    // 3. 21-Class Activity Recognition via Cosine Distance against Centroids
     const { activityClass, confidence } = classifyEmbedding(embedding);
     this.currentActivity = { activityClass, confidence };
 
-    // 4. PPG Waveform Processing (HR, SpO2, HRV)
+    // 4. PPG Waveform Processing (Heart Rate, SpO2 via AC/DC ratio, HRV RMSSD)
     const ppg = processPpgWaveform(this.redBuffer, this.irBuffer);
     if (ppg.hr > 0) {
       this.currentVitals = { hr: ppg.hr, spo2: ppg.spo2, hrv: ppg.hrv };
     }
 
-    // 5. Environmental Heat Index
+    // 5. Environmental Heat Index (NOAA Rothfusz regression equation)
     const heat = computeHeatIndex(this.latestEnv.tempC, this.latestEnv.humPct);
     this.currentHeatIndex = heat;
 
@@ -164,7 +201,7 @@ class EpisodeEngineClass {
       });
     }
 
-    // 7. Calculate RMS & peak acceleration for this window
+    // 7. Calculate RMS & peak acceleration for this window (in mg)
     let sumAccelSq = 0.0;
     let maxAccelMg = 0.0;
     for (let i = 0; i < this.WINDOW_SIZE; i++) {
@@ -175,7 +212,7 @@ class EpisodeEngineClass {
       if (magMg > maxAccelMg) maxAccelMg = magMg;
     }
     const accelRms = Math.sqrt(sumAccelSq / this.WINDOW_SIZE);
-    const eigenvalueRatio = globRaw[3]; // Linearity feature
+    const eigenvalueRatio = globRaw[3]; // Linearity feature (1.0 = single axis, 0.0 = spherical)
 
     // 8. Mathematical Engine Mahalanobis Baselines
     const physEval = MathematicalEngine.evaluateDomain(
@@ -204,7 +241,7 @@ class EpisodeEngineClass {
       );
     }
 
-    // 9. Diagnostic Reasoning Engine Evaluation
+    // 9. Diagnostic Reasoning Engine Evaluation (Clinical Contract)
     const currentLocId = LocationEngine.activeVisit ? LocationEngine.activeVisit.location_id : null;
     const diagnosticContract = DiagnosticReasoningEngine.evaluate({
       physEval,
@@ -227,11 +264,12 @@ class EpisodeEngineClass {
         diagnosticContract.gemma_message = gemmaRes.userMessage;
         diagnosticContract.recommended_action = gemmaRes.recommendedAction;
         try {
-          storeDiagnosticEvent({
+          const eventId = storeDiagnosticEvent({
             ...diagnosticContract,
             episode_id: this.activeEpisode ? this.activeEpisode.episode_id : null,
             location_id: currentLocId
           });
+          diagnosticContract.event_id = eventId;
         } catch (e) {
           // ignore duplicate log error
         }

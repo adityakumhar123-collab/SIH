@@ -89,7 +89,7 @@ import SettingsTab from './src/components/SettingsTab';
 import DashboardTab from './src/components/DashboardTab';
 import DatabaseTab from './src/components/DatabaseTab';
 import styles from './src/components/styles';
-import { saveSetting } from './src/Database';
+import { saveSetting, updateLocationName, getCleanLocationName } from './src/Database';
 
 // Hooks & Modals imports
 import useBle from './src/hooks/useBle';
@@ -97,12 +97,21 @@ import useDatabase from './src/hooks/useDatabase';
 import useEmergency from './src/hooks/useEmergency';
 import ContactFormModal from './src/components/ContactFormModal';
 import TemplateFormModal from './src/components/TemplateFormModal';
+import LocationNamingModal from './src/components/LocationNamingModal';
 
 const { width } = Dimensions.get('window');
 
 export default function App() {
   const insets = useSafeAreaInsets();
   const alertTriggeredRef = useRef(false);
+  const highThreatStreakRef = useRef(0);
+
+  // Spatial & Geofencing state
+  const [userCoords, setUserCoords] = useState(null);
+  const [knownLocations, setKnownLocations] = useState([]);
+  const [activeVisit, setActiveVisit] = useState(null);
+  const [namingPromptNode, setNamingPromptNode] = useState(null);
+  const dismissedNodesRef = useRef(new Map());
 
 
 
@@ -198,6 +207,8 @@ export default function App() {
       try {
         LocationEngine.initialize();
         EpisodeEngine.initialize();
+        setKnownLocations([...LocationEngine.knownNodes]);
+        setActiveVisit(LocationEngine.activeVisit);
 
         const { status } = await Location.requestForegroundPermissionsAsync();
         if (status !== 'granted') {
@@ -211,11 +222,15 @@ export default function App() {
           distanceInterval: 5
         }, (loc) => {
           if (loc && loc.coords) {
-            LocationEngine.onLocationUpdate({
+            const coords = {
               latitude: loc.coords.latitude,
               longitude: loc.coords.longitude,
               accuracy: loc.coords.accuracy
-            });
+            };
+            setUserCoords(coords);
+            LocationEngine.onLocationUpdate(coords);
+            setActiveVisit(LocationEngine.activeVisit);
+            setKnownLocations([...LocationEngine.knownNodes]);
           }
         });
 
@@ -237,6 +252,51 @@ export default function App() {
       clearInterval(watchdogInterval);
     };
   }, []);
+
+  // Listen for newly created or unnamed location nodes
+  useEffect(() => {
+    LocationEngine.setNodeEventListener((event) => {
+      if (event.type === 'NEW_NODE_CREATED' || event.type === 'UNNAMED_NODE_ENTERED') {
+        const node = event.node;
+        if (!node || !node.location_id) return;
+
+        // Anti-spam guard: if a naming prompt is already visible, do not replace
+        setNamingPromptNode((current) => {
+          if (current !== null) return current;
+
+          // Check dismissal cooldown (15 minutes = 900,000 ms)
+          const lastDismissed = dismissedNodesRef.current.get(node.location_id) || 0;
+          if (Date.now() - lastDismissed < 15 * 60 * 1000) {
+            return null; // Suppressed during cooldown
+          }
+
+          return node;
+        });
+      }
+    });
+
+    return () => {
+      LocationEngine.setNodeEventListener(null);
+    };
+  }, []);
+
+  // Location naming actions
+  const handleSaveLocationName = (locationId, newName) => {
+    updateLocationName(locationId, newName);
+    LocationEngine.refreshNodes();
+    setKnownLocations([...LocationEngine.knownNodes]);
+    setNamingPromptNode(null);
+    addLog(`📍 Location #${locationId} saved as "${newName || 'Zone #' + locationId}"`, 'SYSTEM');
+  };
+
+  const handleDismissLocationNaming = (locationId) => {
+    dismissedNodesRef.current.set(locationId, Date.now());
+    setNamingPromptNode(null);
+  };
+
+  const handleManualRenameLocation = (node) => {
+    setNamingPromptNode(node);
+  };
 
   // Keyboard offset animation listeners
   useEffect(() => {
@@ -295,8 +355,10 @@ export default function App() {
 
   const currentPacketRef = useRef(currentPacket);
   const wearConfidenceRef = useRef(wearConfidence);
+  const connectionStateRef = useRef(connectionState);
   currentPacketRef.current = currentPacket;
   wearConfidenceRef.current = wearConfidence;
+  connectionStateRef.current = connectionState;
 
   const {
     contacts,
@@ -341,6 +403,7 @@ export default function App() {
 
   const {
     showAlertModal,
+    setShowAlertModal,
     alertCountdown,
     isDispatched,
     beepingFlash,
@@ -380,11 +443,25 @@ export default function App() {
   const lastLoggedScoreRef = useRef(-1);
 
   // ===========================================================================
-  // TIMER LOOP 1: 3-Second Context Inference (Familiarity & Location Tracking)
-  // Decoupled from the 2 Hz BLE stream to prevent lagging.
+  // TIMER LOOP 1: 3-Second Context & Spatial Inference Loop
+  // ===========================================================================
+  // RATIONALE & ARCHITECTURE:
+  // - ContextEngine.runInference() performs spatial dwell clustering against
+  //   historical SQLite records, updates location familiarity, and evaluates
+  //   macro-environmental conditions.
+  // - This loop is explicitly DECOUPLED (3-second interval = 0.33 Hz) from the
+  //   fast 2 Hz BLE stream. Running SQLite queries at 2 Hz would block the JS
+  //   thread and drop incoming Bluetooth packets.
+  // - Reads currentPacketRef and wearConfidenceRef to avoid stale React closures.
+  // - Updates `famFinal` state (0.0 unfamiliar - 1.0 highly familiar), which
+  //   subsequently feeds into Evaluation Loop 2 below.
   // ===========================================================================
   useEffect(() => {
     const timer = setInterval(() => {
+      // Do not perform spatial inference or update familiarity if disconnected
+      if (connectionStateRef.current !== 'CONNECTED') {
+        return;
+      }
       // Build current telemetry packet from refs to avoid capture of stale state
       const packetForEngine = { ...currentPacketRef.current, wearConfidence: wearConfidenceRef.current };
       try {
@@ -401,11 +478,40 @@ export default function App() {
   }, []);
 
   // ===========================================================================
-  // EVALUATION LOOP 2: 2 Hz Threat Score Recalculation (Lightweight Math Only)
-  // Runs whenever a new BLE feature packet is received, wear confidence updates,
-  // or the 3-second familiarity score changes.
+  // EVALUATION LOOP 2: 2 Hz Reactive Threat Recalculation (Lightweight Math Only)
+  // ===========================================================================
+  // RATIONALE & THREAT STATE MACHINE:
+  // - Runs whenever:
+  //   1. `currentPacket` updates (every 500ms when EpisodeEngine processes a window)
+  //   2. `wearConfidence` state changes (e.g. sensor taken off or worn)
+  //   3. `famFinal` changes (from Timer Loop 1 every 3 seconds)
+  //   4. `cooldownActive` changes (post-cancellation dampening state)
+  //   5. `connectionState` changes (CONNECTED | DISCONNECTED)
+  //
+  // THREAT SCORING FORMULA (computeThreatScoreDetailed):
+  //   - If disconnected or off-wrist: threatScore = 0.0 (prevents false alarms on disconnect/table).
+  //   - If direct escalation (fall hard impact >= 4.0g or severe hypoxemia <= 85%): threatScore = 0.95.
+  //   - If diagnostic hypothesis present: threatScore = baseConfidence * (1.2 - 0.4 * familiarity).
+  //   - If cooldown active: threatScore *= 0.60.
+  //
+  // EMERGENCY ESCALATION THRESHOLD (>= 72%):
+  //   - When threatScore >= 0.72 AND device is CONNECTED AND no alert is active AND not in cooldown:
+  //     -> Locks `alertTriggeredRef.current = true`
+  //     -> Emits SYSTEM log event
+  //     -> Calls `triggerEmergencyPreAlert()` from useEmergency hook, starting
+  //        the 15-second audible countdown with cancellation PIN overlay.
   // ===========================================================================
   useEffect(() => {
+    // Suppress threat evaluation if BLE is disconnected or unworn
+    if (connectionState !== 'CONNECTED' || wearConfidence < 40) {
+      highThreatStreakRef.current = 0;
+      setThreatScore(0.0);
+      setThreatScore3s(0.0);
+      setThreatScore3m(0.0);
+      setThreatScore5m(0.0);
+      return;
+    }
+
     // Merge packet fields and wear confidence state
     const packetForEngine = { ...currentPacket, wearConfidence };
 
@@ -434,16 +540,32 @@ export default function App() {
     }
 
     // Trigger alert modal if:
-    //  - Threat score >= 72%
+    //  - Device is CONNECTED
+    //  - Threat score >= 72% (CRITICAL threshold)
     //  - No alert is currently active (alertTriggeredRef.current is false)
     //  - Alerts are not already dispatched (isDispatched is false)
-    //  - We are not in cooldown
+    //  - We are not in cooldown (60s post-dismissal protection)
+    //
+    // TEMPORAL DEBOUNCE GATE:
+    //  - Direct hard bounds (SpO2 <= 85%, HR >= 180, HR <= 40) or hard falls:
+    //    Require >= 2 consecutive cycles (1.0s) to eliminate single-packet transient sensor glitches.
+    //  - Non-direct threats:
+    //    Require >= 4 consecutive cycles (2.0s) above 0.72.
+    const isDirect = currentPacket.isDirectEscalation || (currentPacket.diagnostic && currentPacket.diagnostic.is_direct_escalation);
+
     if (finalScore >= 0.72 && !alertTriggeredRef.current && !isDispatched && !cooldownActive && !(cooldownActiveRef && cooldownActiveRef.current)) {
-      alertTriggeredRef.current = true;
-      addLog(`🚨 EMERGENCY THREAT DETECTED: Score ${Math.round(finalScore * 100)}% >= 72%. Triggering countdown.`, 'SYSTEM');
-      triggerEmergencyPreAlert();
+      highThreatStreakRef.current += 1;
+      const requiredStreak = isDirect ? 2 : 4;
+      if (highThreatStreakRef.current >= requiredStreak) {
+        highThreatStreakRef.current = 0;
+        alertTriggeredRef.current = true;
+        addLog(`🚨 EMERGENCY THREAT DETECTED: Score ${Math.round(finalScore * 100)}% >= 72%. Triggering countdown.`, 'SYSTEM');
+        triggerEmergencyPreAlert();
+      }
+    } else {
+      highThreatStreakRef.current = 0;
     }
-  }, [currentPacket, wearConfidence, famFinal, cooldownActive]);
+  }, [currentPacket, wearConfidence, famFinal, cooldownActive, connectionState]);
 
   const renderedLogs = useMemo(() => {
     if (!showLogs) return null;
@@ -476,16 +598,24 @@ export default function App() {
     });
   }, [logs, logFilter, showLogs]);
 
+  // ===========================================================================
+  // SVG WAVEFORM GRAPH (Live 50-Point Rolling Buffer)
+  // ===========================================================================
+  // RATIONALE:
+  // - Renders the last 50 IMU samples received via BLE (sampled at 5 Hz to conserve UI thread).
+  // - y = 70 corresponds to 1000 mg (1.0g resting gravity).
+  // - Deviation above 70 indicates dynamic acceleration (steps, tremors, impacts).
+  // ===========================================================================
   const renderedGraph = useMemo(() => {
     if (activeTab !== 'DASHBOARD') return null;
     return (
       <View style={styles.graphContainer}>
         <Svg height="140" width={width - 48}>
-          {/* Threshold line at 128 (middle axis) */}
+          {/* Baseline reference line at 1000 mg (1.0g rest) */}
           <Line x1="0" y1="70" x2={width - 48} y2="70" stroke="#EF4444" strokeWidth="1.5" strokeDasharray="4,4" />
-          <SvgText x="10" y="65" fill="#EF4444" fontSize="10">anomaly threshold (128)</SvgText>
+          <SvgText x="10" y="65" fill="#EF4444" fontSize="10">1.0g Rest Baseline (1000 mg)</SvgText>
 
-          {/* Draw raw resultant accel stream (blue) */}
+          {/* Draw raw resultant accel stream (blue polyline) */}
           {streamData.length > 1 && (
             <Path
               d={streamData.reduce((path, p, idx) => {
@@ -499,12 +629,13 @@ export default function App() {
             />
           )}
 
-          {/* Draw anomaly score overlay (red shaded area) */}
+          {/* Draw anomaly score overlay (red shaded area) - guarded against undefined to avoid NaN */}
           {streamData.length > 1 && (
             <Path
               d={streamData.reduce((path, p, idx) => {
                 const x = (idx / 49) * (width - 48);
-                const y = 140 - (p.anomalyScore * 0.54); // Scaled from 0-255 to fit height
+                const anomalyVal = p.anomalyScore !== undefined ? p.anomalyScore : (threatScore * 255);
+                const y = 140 - (anomalyVal * 0.54);
                 return path + `${idx === 0 ? 'M' : 'L'} ${x} ${y}`;
               }, '') + ` L ${width - 48} 140 L 0 140 Z`}
               fill="rgba(239, 68, 68, 0.15)"
@@ -515,7 +646,7 @@ export default function App() {
         </Svg>
       </View>
     );
-  }, [streamData, width, activeTab]);
+  }, [streamData, width, activeTab, threatScore]);
 
   const threatLevel = getThreatLevel(threatScore);
 
@@ -605,6 +736,10 @@ export default function App() {
             renderedLogs={renderedLogs}
             threatLevel={threatLevel}
             onTestAlert={triggerEmergencyPreAlert}
+            userCoords={userCoords}
+            allNodes={knownLocations.length > 0 ? knownLocations : LocationEngine.knownNodes}
+            activeVisit={activeVisit || LocationEngine.activeVisit}
+            onRenameLocation={handleManualRenameLocation}
           />
         )}
 
@@ -858,6 +993,14 @@ export default function App() {
         templateSelection={templateSelection}
         setTemplateSelection={setTemplateSelection}
         keyboardOffset={keyboardOffset}
+      />
+
+      {/* On-The-Go Location Naming Prompt Modal */}
+      <LocationNamingModal
+        visible={namingPromptNode !== null}
+        node={namingPromptNode}
+        onSave={handleSaveLocationName}
+        onDismiss={handleDismissLocationNaming}
       />
 
     </View>

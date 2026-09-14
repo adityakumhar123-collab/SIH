@@ -108,11 +108,11 @@ export const COLD_START_BASELINES = {
     dimension_names: ['hr', 'spo2'],
     mean_vector: [72.0, 98.0],
     covariance_matrix: [
-      [100.0, -1.8],  // std(HR) = 10 bpm
-      [-1.8,  1.44]   // std(SpO2) = 1.2%
+      [144.0, -2.0],  // std(HR) = 12 bpm
+      [-2.0,  4.0]    // std(SpO2) = 2.0% (healthy adult 94-100% does not falsely trigger)
     ],
     sample_count: 50,
-    purity_gate_threshold: 2.5,
+    purity_gate_threshold: 3.0,
     source: 'COLD_START_NEWS2'
   },
   environment: {
@@ -162,7 +162,7 @@ class MathematicalEngineClass {
 
     for (const [domain, seed] of Object.entries(COLD_START_BASELINES)) {
       let state = getBaselineState(domain, seed.sub_key);
-      if (!state) {
+      if (!state || (domain === 'physiology' && (state.covariance_matrix?.[1]?.[1] < 3.0 || state.source === 'COLD_START_NEWS2'))) {
         saveBaselineState(seed);
         state = seed;
       }
