@@ -44,11 +44,35 @@ class GemmaServiceClass {
 
   checkNativeAvailability() {
     try {
+      if (!NativeModules && typeof require !== 'undefined') {
+        const RN = require('react-native');
+        NativeModules = RN.NativeModules;
+      }
       if (NativeModules && NativeModules.GemmaLocalModule) {
         this.isLocalNativeAvailable = true;
+        return true;
       }
     } catch (e) {
       this.isLocalNativeAvailable = false;
+    }
+    return false;
+  }
+
+  /**
+   * Checks whether the native Gemma on-device module and weights are ready.
+   */
+  async checkNativeModelStatus() {
+    this.checkNativeAvailability();
+    if (!this.isLocalNativeAvailable) {
+      return { available: false, isLoaded: false, reason: 'Native module not linked' };
+    }
+    try {
+      if (NativeModules.GemmaLocalModule.isModelAvailable) {
+        return await NativeModules.GemmaLocalModule.isModelAvailable();
+      }
+      return { available: true, isLoaded: false };
+    } catch (e) {
+      return { available: false, error: e.message };
     }
   }
 
@@ -57,7 +81,7 @@ class GemmaServiceClass {
    *
    * @param {Object} diagnosticContract - from DiagnosticReasoningEngine.evaluate()
    * @param {string} [userName] - wearer's name
-   * @returns {Promise<{ userMessage: string, recommendedAction: string, tone: string, isLocal: boolean }>}
+   * @returns {Promise<{ userMessage: string, recommendedAction: string, tone: string, isLocal: boolean, isNativeLLM?: boolean }>}
    */
   async generateGuidance(diagnosticContract, userName = null) {
     const name = userName || getSetting('user_name', 'there');
@@ -71,20 +95,26 @@ class GemmaServiceClass {
 
     const formattedPrompt = this.buildGemmaPrompt(diagnosticContract, name);
 
-    // 1. Try Native Local On-Device LLM (MediaPipe GenAI / LiteRT / ExecuTorch)
+    // 1. Try Native Local On-Device LLM (MediaPipe GenAI / LiteRT)
+    if (!this.isLocalNativeAvailable) {
+      this.checkNativeAvailability();
+    }
     if (this.isLocalNativeAvailable) {
       try {
+        const configuredModelPath = getSetting('local_gemma_model_path', '');
         const localResponse = await NativeModules.GemmaLocalModule.generateResponse({
           prompt: formattedPrompt,
           maxTokens: 128,
-          temperature: 0.2
+          temperature: 0.2,
+          modelPath: configuredModelPath
         });
         if (localResponse && localResponse.text) {
           return {
             userMessage: localResponse.text.trim(),
             recommendedAction: ACTION_RECOMMENDATIONS[suggested_action_category] || ACTION_RECOMMENDATIONS.rest,
             tone: severity_tier === 'urgent' ? 'urgent_calm' : 'caring_advisory',
-            isLocal: true
+            isLocal: true,
+            isNativeLLM: true
           };
         }
       } catch (err) {

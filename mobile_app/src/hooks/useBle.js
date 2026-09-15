@@ -174,12 +174,27 @@ export default function useBle(activeTab, addLog) {
     heatIndexF: 75.0,
     heatIndexTier: 'NORMAL',
     diagnostic: null,
+    latestGuidance: EpisodeEngine.latestGuidance || null,
     anomalyScore: 0.1060,
     peakAccel: 1000,
     wearConfidence: 100,
     motionState: 1,
     motionEmbedding: new Array(32).fill(0),
   });
+
+  // Keep latestGuidance state in sync with EpisodeEngine async generation
+  useEffect(() => {
+    const handleGuidance = (guidance) => {
+      setCurrentPacket((prev) => ({
+        ...prev,
+        latestGuidance: guidance
+      }));
+    };
+    EpisodeEngine.addGuidanceListener(handleGuidance);
+    return () => {
+      EpisodeEngine.removeGuidanceListener(handleGuidance);
+    };
+  }, []);
 
   // --- Refs ---
   // bleManagerRef: holds the react-native-ble-plx BleManager instance.
@@ -309,6 +324,7 @@ export default function useBle(activeTab, addLog) {
             heatIndexF: windowResult.heatIndex.heatIndexF,
             heatIndexTier: windowResult.heatIndex.tier,
             diagnostic: windowResult.diagnostic,
+            latestGuidance: windowResult.latestGuidance || EpisodeEngine.latestGuidance,
             anomalyScore: windowResult.physEval ? Number((windowResult.physEval.distance / 4.0).toFixed(3)) : 0.1,
             peakAccel: Math.round(windowResult.peakAccelMg),
             wearConfidence: 100

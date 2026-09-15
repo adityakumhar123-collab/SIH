@@ -63,6 +63,7 @@ export default function LocalSpatialMap({
   const [selectedNode, setSelectedNode] = useState(null);
   const [nodeHistoryData, setNodeHistoryData] = useState(null);
   const [showUserModal, setShowUserModal] = useState(false);
+  const [overlapChoice, setOverlapChoice] = useState(null);
 
   // Radar sweep animation for the user marker
   const pulseAnim = useRef(new Animated.Value(0)).current;
@@ -299,66 +300,110 @@ export default function LocalSpatialMap({
           {displayNodes.map((node) => {
             const nx = cx + node.dx * scale;
             const ny = cy + node.dy * scale;
-            const rPx = Math.max(12, node.entryRadiusMeters * scale);
+            const rPx = Math.max(16, node.entryRadiusMeters * scale);
             const isInside = activeVisit && activeVisit.location_id === node.location_id;
 
             const strokeColor = isInside ? '#10B981' : '#8B5CF6';
-            const fillColor = isInside ? 'rgba(16, 185, 129, 0.15)' : 'rgba(139, 92, 246, 0.1)';
+            const fillColor = isInside ? 'rgba(16, 185, 129, 0.16)' : 'rgba(139, 92, 246, 0.1)';
             const cleanName = getCleanLocationName(node);
 
+            // Compute distance from center (user marker) in screen pixels
+            const pixelDistFromUser = Math.sqrt((nx - cx) * (nx - cx) + (ny - cy) * (ny - cy));
+            const isOverlappingUser = pixelDistFromUser < 36;
+
+            // When overlapping user, position node label ABOVE the pin (ny - 34), otherwise BELOW (ny + 14)
+            const pillY = isOverlappingUser ? ny - 34 : ny + 14;
+
             return (
-              <G key={`node-${node.location_id}`} onPress={() => handleNodePress(node)}>
+              <G
+                key={`node-${node.location_id}`}
+                onPress={() => {
+                  if (isOverlappingUser) {
+                    setOverlapChoice({ node });
+                  } else {
+                    handleNodePress(node);
+                  }
+                }}
+              >
+                {/* Generous Invisible Hit Target Area (68px diameter) */}
+                <Circle
+                  cx={nx}
+                  cy={ny}
+                  r="34"
+                  fill="#000000"
+                  fillOpacity="0.01"
+                />
+
                 {/* Entry Radius Circle */}
                 <Circle
                   cx={nx}
                   cy={ny}
                   r={rPx}
                   stroke={strokeColor}
-                  strokeWidth="1.5"
+                  strokeWidth="2"
                   strokeDasharray="4, 4"
                   fill={fillColor}
                 />
 
-                {/* Node Center Pin Core */}
+                {/* Outer Glow Halo Ring (Enlarged: r=16) */}
                 <Circle
                   cx={nx}
                   cy={ny}
-                  r="6"
-                  fill={strokeColor}
-                  stroke="#FFFFFF"
-                  strokeWidth="1.5"
+                  r="16"
+                  fill={isInside ? 'rgba(16, 185, 129, 0.28)' : 'rgba(139, 92, 246, 0.22)'}
+                  stroke={strokeColor}
+                  strokeWidth="1"
+                  strokeDasharray="2, 2"
                 />
 
-                {/* Node Label Pill Background */}
+                {/* Main Node Pin Core (Enlarged: r=10) */}
+                <Circle
+                  cx={nx}
+                  cy={ny}
+                  r="10"
+                  fill={strokeColor}
+                  stroke="#FFFFFF"
+                  strokeWidth="2.5"
+                />
+
+                {/* Center Core Dot */}
+                <Circle
+                  cx={nx}
+                  cy={ny}
+                  r="4"
+                  fill="#FFFFFF"
+                />
+
+                {/* Node Label Pill Background (Enlarged: 88x24) */}
                 <Rect
-                  x={nx - 36}
-                  y={ny + 8}
-                  width="72"
-                  height="16"
-                  rx="4"
-                  fill="rgba(15, 23, 42, 0.85)"
+                  x={nx - 44}
+                  y={pillY}
+                  width="88"
+                  height="24"
+                  rx="6"
+                  fill="rgba(15, 23, 42, 0.95)"
                   stroke={strokeColor}
-                  strokeWidth="0.8"
+                  strokeWidth="1.2"
                 />
 
                 {/* Node Name */}
                 <SvgText
                   x={nx}
-                  y={ny + 19}
+                  y={pillY + 16}
                   fill="#F8FAFC"
-                  fontSize="9"
+                  fontSize="10"
                   fontWeight="bold"
                   textAnchor="middle"
                 >
-                  {cleanName.length > 10 ? cleanName.substring(0, 9) + '…' : cleanName}
+                  {cleanName.length > 11 ? cleanName.substring(0, 10) + '…' : cleanName}
                 </SvgText>
 
                 {/* Distance Badge */}
                 <SvgText
                   x={nx}
-                  y={ny - rPx - 4}
+                  y={pillY === ny - 34 ? pillY - 4 : ny - rPx - 4}
                   fill={strokeColor}
-                  fontSize="8"
+                  fontSize="9"
                   fontWeight="bold"
                   textAnchor="middle"
                 >
@@ -369,56 +414,81 @@ export default function LocalSpatialMap({
           })}
 
           {/* 7. User Current Location Pulse & Dot (Clickable) */}
-          <G onPress={() => setShowUserModal(true)}>
+          <G
+            onPress={() => {
+              // Check if any node is overlapping the user marker (within 36px)
+              const overlapping = displayNodes.find((n) => {
+                const nx = cx + n.dx * scale;
+                const ny = cy + n.dy * scale;
+                return Math.sqrt((nx - cx) * (nx - cx) + (ny - cy) * (ny - cy)) < 36;
+              });
+              if (overlapping) {
+                setOverlapChoice({ node: overlapping });
+              } else {
+                setShowUserModal(true);
+              }
+            }}
+          >
+            {/* Generous Invisible Hit Target Area (64px diameter) */}
+            <Circle
+              cx={cx}
+              cy={cy}
+              r="32"
+              fill="#000000"
+              fillOpacity="0.01"
+            />
+
             {/* Pulsing Radar Aura */}
             <Circle
               cx={cx}
               cy={cy}
-              r="22"
-              fill="rgba(59, 130, 246, 0.15)"
-              stroke="rgba(59, 130, 246, 0.4)"
-              strokeWidth="1"
-              strokeDasharray="3, 3"
+              r="26"
+              fill="rgba(59, 130, 246, 0.2)"
+              stroke="rgba(59, 130, 246, 0.5)"
+              strokeWidth="1.5"
+              strokeDasharray="4, 3"
             />
             {/* Outer Blue Ring */}
             <Circle
               cx={cx}
               cy={cy}
-              r="12"
-              fill="rgba(59, 130, 246, 0.3)"
+              r="14"
+              fill="rgba(59, 130, 246, 0.35)"
               stroke="#3B82F6"
-              strokeWidth="1.5"
+              strokeWidth="2"
             />
             {/* Inner Glowing Core */}
             <Circle
               cx={cx}
               cy={cy}
-              r="6"
+              r="8"
               fill="#3B82F6"
               stroke="#FFFFFF"
-              strokeWidth="1.5"
+              strokeWidth="2"
             />
             {/* Center White Pin */}
             <Circle
               cx={cx}
               cy={cy}
-              r="2"
+              r="3"
               fill="#FFFFFF"
             />
-            {/* User Label */}
+            {/* User Label Pill (Shifted below center to avoid collision with top node pill) */}
             <Rect
-              x={cx - 18}
-              y={cy + 14}
-              width="36"
-              height="14"
-              rx="3"
+              x={cx - 24}
+              y={cy + 18}
+              width="48"
+              height="18"
+              rx="4"
               fill="#3B82F6"
+              stroke="#FFFFFF"
+              strokeWidth="0.8"
             />
             <SvgText
               x={cx}
-              y={cy + 24}
+              y={cy + 31}
               fill="#FFFFFF"
-              fontSize="8"
+              fontSize="9"
               fontWeight="bold"
               textAnchor="middle"
             >
@@ -460,6 +530,111 @@ export default function LocalSpatialMap({
           <Text style={mapStyles.hudSubtext}>Tap node or YOU for telemetry</Text>
         </View>
       </View>
+
+      {/* ─── QUICK NODE SELECTOR STRIP (1-Tap Reliable Interaction) ── */}
+      <View style={mapStyles.quickStripWrapper}>
+        <Text style={mapStyles.quickStripTitle}>QUICK INSPECT</Text>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={mapStyles.quickStripScroll}
+        >
+          {/* User Live Chip */}
+          <TouchableOpacity
+            delayPressIn={0}
+            onPress={() => setShowUserModal(true)}
+            style={mapStyles.quickChipUser}
+            activeOpacity={0.7}
+          >
+            <View style={mapStyles.quickChipUserDot} />
+            <Text style={mapStyles.quickChipUserText}>👤 YOU (Live)</Text>
+          </TouchableOpacity>
+
+          {/* Node Chips */}
+          {displayNodes.map((node) => {
+            const isInside = activeVisit && activeVisit.location_id === node.location_id;
+            const cleanName = getCleanLocationName(node);
+            return (
+              <TouchableOpacity
+                delayPressIn={0}
+                key={`quick-chip-${node.location_id}`}
+                onPress={() => handleNodePress(node)}
+                style={[
+                  mapStyles.quickChipNode,
+                  isInside && mapStyles.quickChipNodeActive,
+                ]}
+                activeOpacity={0.7}
+              >
+                <Text style={mapStyles.quickChipNodeIcon}>{isInside ? '🟢' : '📍'}</Text>
+                <Text
+                  style={[
+                    mapStyles.quickChipNodeText,
+                    isInside && { color: '#10B981', fontWeight: 'bold' },
+                  ]}
+                  numberOfLines={1}
+                >
+                  {cleanName} ({Math.round(node.distMeters)}m)
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </ScrollView>
+      </View>
+
+      {/* ─── OVERLAPPING POSITION AMBIGUITY SELECTOR MODAL ─────────── */}
+      <Modal
+        visible={overlapChoice !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setOverlapChoice(null)}
+      >
+        <View style={mapStyles.modalOverlay}>
+          <View style={[mapStyles.modalCard, { maxWidth: 360 }]}>
+            <View style={mapStyles.modalHeader}>
+              <View style={{ flex: 1 }}>
+                <Text style={mapStyles.modalNodeTag}>📍 OVERLAPPING POSITION</Text>
+                <Text style={mapStyles.modalNodeTitle}>Select Telemetry View</Text>
+              </View>
+              <TouchableOpacity delayPressIn={0} onPress={() => setOverlapChoice(null)} style={mapStyles.closeBtn}>
+                <Text style={mapStyles.closeBtnText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={{ color: '#94A3B8', fontSize: 13, lineHeight: 18, marginVertical: 14 }}>
+              You are currently standing at{' '}
+              <Text style={{ color: '#FFFFFF', fontWeight: 'bold' }}>
+                {overlapChoice?.node ? getCleanLocationName(overlapChoice.node) : 'this location'}
+              </Text>. Which telemetry record would you like to inspect?
+            </Text>
+
+            <TouchableOpacity
+              delayPressIn={0}
+              onPress={() => {
+                const targetNode = overlapChoice.node;
+                setOverlapChoice(null);
+                handleNodePress(targetNode);
+              }}
+              style={[mapStyles.doneBtn, { backgroundColor: '#8B5CF6', marginBottom: 10 }]}
+            >
+              <Text style={mapStyles.doneBtnText}>
+                📍 Inspect {overlapChoice?.node ? getCleanLocationName(overlapChoice.node) : 'Location'} Details
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              delayPressIn={0}
+              onPress={() => {
+                setOverlapChoice(null);
+                setShowUserModal(true);
+              }}
+              style={[mapStyles.doneBtn, { backgroundColor: '#3B82F6' }]}
+            >
+              <Text style={mapStyles.doneBtnText}>
+                👤 Inspect YOU (Live Real-Time Telemetry)
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
 
       {/* ─── NODE DETAIL MODAL / POPOVER ────────────────────────────── */}
       {/* Displays last stored environment, kind of motion, and physiological condition */}
@@ -1015,5 +1190,66 @@ const mapStyles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 13,
     fontWeight: 'bold',
+  },
+  quickStripWrapper: {
+    marginTop: 12,
+  },
+  quickStripTitle: {
+    color: '#64748B',
+    fontSize: 9,
+    fontWeight: 'bold',
+    letterSpacing: 0.8,
+    marginBottom: 6,
+    marginLeft: 2,
+  },
+  quickStripScroll: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingBottom: 2,
+  },
+  quickChipUser: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(59, 130, 246, 0.18)',
+    borderWidth: 1,
+    borderColor: '#3B82F6',
+    borderRadius: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  quickChipUserDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: '#38BDF8',
+    marginRight: 6,
+  },
+  quickChipUserText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: 'bold',
+  },
+  quickChipNode: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    borderRadius: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  quickChipNodeActive: {
+    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+    borderColor: '#10B981',
+  },
+  quickChipNodeIcon: {
+    fontSize: 11,
+    marginRight: 6,
+  },
+  quickChipNodeText: {
+    color: '#CBD5E1',
+    fontSize: 11,
+    fontWeight: '500',
   },
 });

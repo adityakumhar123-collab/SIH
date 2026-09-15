@@ -137,6 +137,9 @@ const DashboardTab = React.memo(({
   allNodes = [],
   activeVisit = null,
   onRenameLocation = null,
+  onVerifyGuidance = null,
+  onDismissGuidance = null,
+  onOpenChat = null,
 }) => {
   const [showEvidence, setShowEvidence] = useState(false);
 
@@ -410,31 +413,134 @@ const DashboardTab = React.memo(({
           )}
         </View>
 
-        {/* Gemma 3n Empathetic Guidance Banner */}
-        <View style={{
-          backgroundColor: 'rgba(59, 130, 246, 0.08)',
-          borderRadius: 10,
-          borderWidth: 1,
-          borderColor: 'rgba(59, 130, 246, 0.2)',
-          padding: 12,
-          marginTop: 6
-        }}>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-              <Text style={{ fontSize: 13, marginRight: 6 }}>🤖</Text>
-              <Text style={{ color: '#60A5FA', fontSize: 11, fontWeight: 'bold' }}>Gemma 3n (Local On-Device AI)</Text>
+        {/* Gemma 3n Verified Guidance & Notification Hub */}
+        {(() => {
+          const activeGuidance = currentPacket?.latestGuidance || (diag?.gemma_message ? {
+            message: diag.gemma_message,
+            recommendedAction: diag.recommended_action || 'Rest in a well-ventilated area.',
+            hypothesis: diag.primary_hypothesis,
+            severityTier: diag.severity_tier || 'advisory',
+            timestamp: Date.now(),
+            verified: false,
+            eventId: diag.event_id || null,
+            isNativeLLM: false
+          } : null);
+
+          const isAlert = activeGuidance && activeGuidance.hypothesis && activeGuidance.hypothesis !== 'NORMAL_BASELINE' && activeGuidance.hypothesis !== 'EXERTION_BENIGN';
+          const isVerified = activeGuidance?.verified;
+
+          return (
+            <View style={{
+              backgroundColor: isAlert ? (isVerified ? 'rgba(16, 185, 129, 0.08)' : 'rgba(245, 158, 11, 0.1)') : 'rgba(59, 130, 246, 0.08)',
+              borderRadius: 12,
+              borderWidth: 1,
+              borderColor: isAlert ? (isVerified ? '#10B981' : '#F59E0B') : 'rgba(59, 130, 246, 0.25)',
+              padding: 12,
+              marginTop: 10
+            }}>
+              {/* Header row */}
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  <Text style={{ fontSize: 14, marginRight: 6 }}>{isAlert ? (isVerified ? '✅' : '⚠️') : '🤖'}</Text>
+                  <Text style={{ color: isAlert ? (isVerified ? '#10B981' : '#F59E0B') : '#60A5FA', fontSize: 12, fontWeight: 'bold' }}>
+                    {isAlert ? (isVerified ? 'Verified Health Guidance' : 'Active Advisory — Please Verify') : 'Gemma 3n On-Device AI'}
+                  </Text>
+                </View>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  {activeGuidance?.isNativeLLM && (
+                    <View style={{ paddingHorizontal: 5, paddingVertical: 2, borderRadius: 4, backgroundColor: 'rgba(6, 182, 212, 0.2)' }}>
+                      <Text style={{ color: '#06B6D4', fontSize: 9, fontWeight: 'bold' }}>⚡ NPU</Text>
+                    </View>
+                  )}
+                  <View style={{
+                    paddingHorizontal: 6,
+                    paddingVertical: 2,
+                    borderRadius: 4,
+                    backgroundColor: isVerified ? 'rgba(16, 185, 129, 0.2)' : (isAlert ? 'rgba(245, 158, 11, 0.2)' : 'rgba(16, 185, 129, 0.15)'),
+                    borderWidth: 1,
+                    borderColor: isVerified ? '#10B981' : (isAlert ? '#F59E0B' : 'rgba(16, 185, 129, 0.35)')
+                  }}>
+                    <Text style={{ color: isVerified ? '#10B981' : (isAlert ? '#F59E0B' : '#10B981'), fontSize: 9, fontWeight: '700' }}>
+                      {isVerified ? '✅ VERIFIED' : (isAlert ? '⚠️ UNVERIFIED' : '🔒 100% OFFLINE')}
+                    </Text>
+                  </View>
+                </View>
+              </View>
+
+              {/* Message text */}
+              <Text style={{ color: '#F1F5F9', fontSize: 12, lineHeight: 18 }}>
+                {activeGuidance?.message || (threatScore < 0.4
+                  ? 'All physiological and environmental indicators are currently resting safely within normal limits.'
+                  : 'Elevated deviation detected. Rest in a well-ventilated area and hydrate.')}
+              </Text>
+
+              {/* Recommended Action banner */}
+              {activeGuidance?.recommendedAction && (
+                <View style={{
+                  backgroundColor: 'rgba(0, 0, 0, 0.25)',
+                  borderRadius: 8,
+                  padding: 8,
+                  marginTop: 8,
+                  borderLeftWidth: 3,
+                  borderLeftColor: isAlert ? '#F59E0B' : '#60A5FA'
+                }}>
+                  <Text style={{ color: '#94A3B8', fontSize: 10, fontWeight: '700', marginBottom: 2 }}>RECOMMENDED ACTION:</Text>
+                  <Text style={{ color: '#E2E8F0', fontSize: 11 }}>{activeGuidance.recommendedAction}</Text>
+                </View>
+              )}
+
+              {/* Action Buttons: Verify, Discuss, Dismiss */}
+              <View style={{ flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', marginTop: 10, gap: 8 }}>
+                {isAlert && !isVerified && onVerifyGuidance && (
+                  <TouchableOpacity
+                    delayPressIn={0}
+                    onPress={() => onVerifyGuidance(activeGuidance.eventId)}
+                    style={{
+                      backgroundColor: '#10B981',
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                      borderRadius: 6
+                    }}
+                  >
+                    <Text style={{ color: '#FFFFFF', fontSize: 11, fontWeight: 'bold' }}>✓ Verify & Confirm</Text>
+                  </TouchableOpacity>
+                )}
+
+                {onOpenChat && (
+                  <TouchableOpacity
+                    delayPressIn={0}
+                    onPress={() => onOpenChat(activeGuidance ? `Can you explain this guidance: "${activeGuidance.message}"?` : 'How are my vitals today?')}
+                    style={{
+                      backgroundColor: 'rgba(6, 182, 212, 0.2)',
+                      borderWidth: 1,
+                      borderColor: '#06B6D4',
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                      borderRadius: 6
+                    }}
+                  >
+                    <Text style={{ color: '#06B6D4', fontSize: 11, fontWeight: 'bold' }}>💬 Ask Gemma</Text>
+                  </TouchableOpacity>
+                )}
+
+                {isAlert && onDismissGuidance && (
+                  <TouchableOpacity
+                    delayPressIn={0}
+                    onPress={onDismissGuidance}
+                    style={{
+                      backgroundColor: 'rgba(255, 255, 255, 0.08)',
+                      paddingHorizontal: 8,
+                      paddingVertical: 6,
+                      borderRadius: 6
+                    }}
+                  >
+                    <Text style={{ color: '#94A3B8', fontSize: 11, fontWeight: '600' }}>✕ Dismiss</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
             </View>
-            <View style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, backgroundColor: 'rgba(16, 185, 129, 0.15)', borderWidth: 1, borderColor: 'rgba(16, 185, 129, 0.35)' }}>
-              <Text style={{ color: '#10B981', fontSize: 9, fontWeight: '700' }}>🔒 100% Offline</Text>
-            </View>
-          </View>
-          <Text style={{ color: '#E2E8F0', fontSize: 12, lineHeight: 18 }}>
-            {diag?.gemma_message ||
-              (threatScore < 0.4
-                ? 'All physiological and environmental indicators are currently resting safely within normal limits.'
-                : 'Elevated deviation detected. Rest in a well-ventilated area and hydrate.')}
-          </Text>
-        </View>
+          );
+        })()}
 
         {/* Expandable Contributing Evidence Drawer */}
         <View style={{ marginTop: 12 }}>

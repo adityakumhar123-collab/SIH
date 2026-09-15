@@ -84,6 +84,73 @@ class EpisodeEngineClass {
     this.currentDiagnostic = null;
     this.anomalyPersistenceMinutes = 0;
     this.anomalyStartTimestamp = 0;
+
+    // Persistent Latched Gemma Guidance (does not vanish on next 500ms tick)
+    this.latestGuidance = {
+      message: 'All physiological and environmental indicators are currently resting safely within normal limits.',
+      recommendedAction: 'Continue normal routine and maintain regular hydration.',
+      tone: 'calm',
+      hypothesis: 'NORMAL_BASELINE',
+      severityTier: 'normal',
+      timestamp: Date.now(),
+      eventId: null,
+      verified: false,
+      evidence: [],
+      isNativeLLM: false
+    };
+    this.guidanceListeners = [];
+  }
+
+  addGuidanceListener(fn) {
+    if (typeof fn === 'function' && !this.guidanceListeners.includes(fn)) {
+      this.guidanceListeners.push(fn);
+    }
+  }
+
+  removeGuidanceListener(fn) {
+    this.guidanceListeners = this.guidanceListeners.filter(l => l !== fn);
+  }
+
+  verifyActiveGuidance(eventId = null, notes = 'Verified by user') {
+    if (this.latestGuidance) {
+      this.latestGuidance = {
+        ...this.latestGuidance,
+        verified: true,
+        verifiedAt: Date.now()
+      };
+      const targetId = eventId || this.latestGuidance.eventId;
+      if (targetId) {
+        try {
+          const { verifyDiagnosticEvent } = require('./Database.js');
+          verifyDiagnosticEvent(targetId, notes);
+        } catch (e) {
+          // ignore
+        }
+      }
+      for (const listener of this.guidanceListeners) {
+        try { listener(this.latestGuidance); } catch (err) {}
+      }
+    }
+    return this.latestGuidance;
+  }
+
+  dismissActiveGuidance() {
+    this.latestGuidance = {
+      message: 'All physiological and environmental indicators are currently resting safely within normal limits.',
+      recommendedAction: 'Continue normal routine and maintain regular hydration.',
+      tone: 'calm',
+      hypothesis: 'NORMAL_BASELINE',
+      severityTier: 'normal',
+      timestamp: Date.now(),
+      eventId: null,
+      verified: true,
+      evidence: [],
+      isNativeLLM: false
+    };
+    for (const listener of this.guidanceListeners) {
+      try { listener(this.latestGuidance); } catch (err) {}
+    }
+    return this.latestGuidance;
   }
 
   initialize() {
@@ -263,8 +330,9 @@ class EpisodeEngineClass {
       GemmaService.generateGuidance(diagnosticContract).then(gemmaRes => {
         diagnosticContract.gemma_message = gemmaRes.userMessage;
         diagnosticContract.recommended_action = gemmaRes.recommendedAction;
+        let eventId = null;
         try {
-          const eventId = storeDiagnosticEvent({
+          eventId = storeDiagnosticEvent({
             ...diagnosticContract,
             episode_id: this.activeEpisode ? this.activeEpisode.episode_id : null,
             location_id: currentLocId
@@ -272,6 +340,24 @@ class EpisodeEngineClass {
           diagnosticContract.event_id = eventId;
         } catch (e) {
           // ignore duplicate log error
+        }
+
+        // Latch the active guidance so it remains visible for user verification
+        const guidanceUpdate = {
+          message: gemmaRes.userMessage,
+          recommendedAction: gemmaRes.recommendedAction,
+          tone: gemmaRes.tone,
+          hypothesis: diagnosticContract.primary_hypothesis,
+          severityTier: diagnosticContract.severity_tier,
+          timestamp: Date.now(),
+          eventId: eventId,
+          verified: false,
+          evidence: diagnosticContract.contributing_evidence || [],
+          isNativeLLM: !!gemmaRes.isNativeLLM
+        };
+        this.latestGuidance = guidanceUpdate;
+        for (const listener of this.guidanceListeners) {
+          try { listener(guidanceUpdate); } catch(err) {}
         }
       });
     }
@@ -322,6 +408,7 @@ class EpisodeEngineClass {
       vitals: this.currentVitals,
       heatIndex: heat,
       diagnostic: diagnosticContract,
+      latestGuidance: this.latestGuidance,
       physEval,
       envEval,
       accelRms,

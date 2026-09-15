@@ -52,7 +52,9 @@ import { DiagnosticReasoningEngine, HYPOTHESES } from './src/DiagnosticReasoning
 import { LocationEngine } from './src/LocationEngine.js';
 import { ContextEngine, computeThreatScoreDetailed, getThreatLevel } from './src/ContextEngine.js';
 import { GemmaService } from './src/GemmaService.js';
+import { GemmaAgent } from './src/GemmaAgent.js';
 import { BackgroundServices } from './src/BackgroundServices.js';
+import { verifyDiagnosticEvent, getDiagnosticEvent } from './src/Database.js';
 
 function logResult(name, passed, detail = '') {
   if (passed) {
@@ -419,6 +421,45 @@ async function runAllTests() {
     "Gemma 3 Instruction Chat Template Formatting",
     gemmaPrompt.includes('<start_of_turn>user') && gemmaPrompt.includes('<end_of_turn>') && gemmaPrompt.includes('<start_of_turn>model'),
     "Adheres to official Gemma 3 conversational turn tokenization."
+  );
+
+  // GemmaAgent Tool Calling Tests
+  const agentVitalsRes = await GemmaAgent.processMessage("What are my vitals today and how do they look?", { hr: 75, spo2: 98 });
+  logResult(
+    "GemmaAgent Tool Calling: query_vitals_summary",
+    agentVitalsRes.toolUsed && agentVitalsRes.toolUsed.name === 'get_vitals_summary' && agentVitalsRes.text.length > 20,
+    `Tool: ${agentVitalsRes.toolUsed?.name} -> "${agentVitalsRes.text.substring(0, 70)}..."`
+  );
+
+  const agentProfileRes = await GemmaAgent.processMessage("What is my registered blood group and allergies?");
+  logResult(
+    "GemmaAgent Tool Calling: query_user_profile",
+    agentProfileRes.toolUsed && agentProfileRes.toolUsed.name === 'get_user_profile' && agentProfileRes.text.includes('Blood group'),
+    `Tool: ${agentProfileRes.toolUsed?.name} -> "${agentProfileRes.text.substring(0, 70)}..."`
+  );
+
+  const agentAlertsRes = await GemmaAgent.processMessage("Show me my recent alerts and warnings");
+  logResult(
+    "GemmaAgent Tool Calling: query_diagnostic_alerts",
+    agentAlertsRes.toolUsed && agentAlertsRes.toolUsed.name === 'get_diagnostic_alerts',
+    `Tool: ${agentAlertsRes.toolUsed?.name} -> "${agentAlertsRes.text.substring(0, 70)}..."`
+  );
+
+  // Diagnostic Event Verification Test
+  const testEventId = storeDiagnosticEvent({
+    primary_hypothesis: 'HEAT_STRESS_DEHYDRATION',
+    confidence: 0.95,
+    severity_tier: 'advisory',
+    suggested_action_category: 'seek_shade',
+    contributing_evidence: ['Ambient Heat Index 102F', 'Resting Tachycardia'],
+    timestamp: Date.now()
+  });
+  verifyDiagnosticEvent(testEventId, 'Verified safe by Priya in test suite');
+  const verifiedEvent = getDiagnosticEvent(testEventId);
+  logResult(
+    "Diagnostic Event User Verification & Latching",
+    verifiedEvent && verifiedEvent.user_status === 'VERIFIED',
+    `Event #${testEventId} user_status updated to '${verifiedEvent?.user_status}'`
   );
 
   // ───────────────────────────────────────────────────────────────────────────

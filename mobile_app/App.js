@@ -88,6 +88,7 @@ import TemplatesTab from './src/components/TemplatesTab';
 import SettingsTab from './src/components/SettingsTab';
 import DashboardTab from './src/components/DashboardTab';
 import DatabaseTab from './src/components/DatabaseTab';
+import ChatTab from './src/components/ChatTab';
 import styles from './src/components/styles';
 import { saveSetting, updateLocationName, getCleanLocationName } from './src/Database';
 
@@ -98,6 +99,7 @@ import useEmergency from './src/hooks/useEmergency';
 import ContactFormModal from './src/components/ContactFormModal';
 import TemplateFormModal from './src/components/TemplateFormModal';
 import LocationNamingModal from './src/components/LocationNamingModal';
+import NavigationDrawer from './src/components/NavigationDrawer';
 
 const { width } = Dimensions.get('window');
 
@@ -105,6 +107,9 @@ export default function App() {
   const insets = useSafeAreaInsets();
   const alertTriggeredRef = useRef(false);
   const highThreatStreakRef = useRef(0);
+
+  // Navigation Drawer State
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
   // Spatial & Geofencing state
   const [userCoords, setUserCoords] = useState(null);
@@ -130,6 +135,7 @@ export default function App() {
 
   // Form modals and tab selections
   const [activeTab, setActiveTab] = useState('DASHBOARD');
+  const [initialChatPrompt, setInitialChatPrompt] = useState(null);
   const [editingContact, setEditingContact] = useState(null);
   const [showContactModal, setShowContactModal] = useState(false);
 
@@ -401,6 +407,21 @@ export default function App() {
     }
   };
 
+  const handleVerifyGuidance = (eventId) => {
+    EpisodeEngine.verifyActiveGuidance(eventId, 'Verified & confirmed by user in app');
+    addLog('[AI] Health guidance verified and confirmed safe by user.', 'SYSTEM');
+  };
+
+  const handleDismissGuidance = () => {
+    EpisodeEngine.dismissActiveGuidance();
+    addLog('[AI] Advisory notification dismissed.', 'SYSTEM');
+  };
+
+  const handleOpenChat = (prompt = null) => {
+    if (prompt) setInitialChatPrompt(prompt);
+    setActiveTab('CHAT');
+  };
+
   const {
     showAlertModal,
     setShowAlertModal,
@@ -660,6 +681,44 @@ export default function App() {
           </Text>
         </View>
       )}
+      {/* Executive Top Navigation Header Bar */}
+      <View style={styles.topHeaderBar}>
+        <TouchableOpacity
+          delayPressIn={0}
+          onPress={() => setDrawerOpen(true)}
+          style={styles.hamburgerBtn}
+          activeOpacity={0.7}
+          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+        >
+          <Text style={styles.hamburgerIcon}>☰</Text>
+        </TouchableOpacity>
+        <View style={styles.topHeaderCenter}>
+          <Text style={styles.topHeaderTitle}>🛡️ RakshaBand</Text>
+          <Text style={styles.topHeaderSubtitle}>OS v3.2 • Offline Clinical AI</Text>
+        </View>
+        <TouchableOpacity
+          delayPressIn={0}
+          onPress={() => setDrawerOpen(true)}
+          style={styles.activeTabPill}
+          activeOpacity={0.7}
+        >
+          <Text style={styles.activeTabPillText}>
+            {activeTab === 'DASHBOARD'
+              ? '🏠 Dash'
+              : activeTab === 'CHAT'
+              ? '🤖 Chat'
+              : activeTab === 'CONTACTS'
+              ? '👥 Contacts'
+              : activeTab === 'TEMPLATES'
+              ? '📝 Templates'
+              : activeTab === 'SETTINGS'
+              ? '⚙️ Settings'
+              : '📁 DB'}{' '}
+            ▾
+          </Text>
+        </TouchableOpacity>
+      </View>
+
       <ScrollView contentContainerStyle={styles.scrollContent}>
 
         {/* Twilio Balance Low/Exhausted Warnings */}
@@ -677,28 +736,6 @@ export default function App() {
             </Text>
           </View>
         )}
-
-        {/* App Navigation Tab Bar */}
-        <View style={styles.tabContainer}>
-          {[
-            { id: 'DASHBOARD', label: '🏠 Dash' },
-            { id: 'CONTACTS', label: '👥 Contacts' },
-            { id: 'TEMPLATES', label: '📝 Templates' },
-            { id: 'SETTINGS', label: '⚙️ Settings' },
-            { id: 'DATABASE', label: '📁 DB' }
-          ].map((tab) => (
-            <TouchableOpacity
-              delayPressIn={0}
-              key={tab.id}
-              style={[styles.tabButton, activeTab === tab.id && styles.tabButtonActive]}
-              onPress={() => setActiveTab(tab.id)}
-            >
-              <Text style={[styles.tabButtonText, activeTab === tab.id && styles.tabButtonTextActive]}>
-                {tab.label}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </View>
 
         {activeTab === 'DASHBOARD' && (
           <DashboardTab
@@ -740,6 +777,17 @@ export default function App() {
             allNodes={knownLocations.length > 0 ? knownLocations : LocationEngine.knownNodes}
             activeVisit={activeVisit || LocationEngine.activeVisit}
             onRenameLocation={handleManualRenameLocation}
+            onVerifyGuidance={handleVerifyGuidance}
+            onDismissGuidance={handleDismissGuidance}
+            onOpenChat={handleOpenChat}
+          />
+        )}
+
+        {activeTab === 'CHAT' && (
+          <ChatTab
+            currentPacket={currentPacket}
+            initialPrompt={initialChatPrompt}
+            onClearInitialPrompt={() => setInitialChatPrompt(null)}
           />
         )}
 
@@ -1001,6 +1049,17 @@ export default function App() {
         node={namingPromptNode}
         onSave={handleSaveLocationName}
         onDismiss={handleDismissLocationNaming}
+      />
+
+      {/* Tactical Slide-Out Hamburger Navigation Drawer */}
+      <NavigationDrawer
+        visible={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        activeTab={activeTab}
+        onSelectTab={setActiveTab}
+        connectionState={connectionState}
+        batteryPct={batteryPct}
+        uptime={uptime}
       />
 
     </View>

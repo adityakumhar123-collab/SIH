@@ -709,6 +709,68 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     zIndex: 9999,
   },
+  // Executive Top Navigation Header Bar & Hamburger Menu
+  topHeaderBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: 'rgba(15, 23, 42, 0.75)',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginHorizontal: 16,
+    marginTop: 8,
+    marginBottom: 4,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+  },
+  hamburgerBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: 'rgba(59, 130, 246, 0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(59, 130, 246, 0.3)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  hamburgerIcon: {
+    color: '#60A5FA',
+    fontSize: 20,
+    fontWeight: 'bold',
+  },
+  topHeaderCenter: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  topHeaderTitle: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: 'bold',
+    letterSpacing: 0.5,
+  },
+  topHeaderSubtitle: {
+    color: '#94A3B8',
+    fontSize: 10,
+    marginTop: 1,
+  },
+  activeTabPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  activeTabPillText: {
+    color: '#F8FAFC',
+    fontSize: 11,
+    fontWeight: '600',
+  },
 });
 
 export default styles;

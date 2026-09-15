@@ -852,6 +852,80 @@ export function updateDiagnosticEventStatus(eventId, userStatus, escalationStatu
   }
 }
 
+export function verifyDiagnosticEvent(eventId, notes = 'Confirmed by user') {
+  const database = initDatabase();
+  database.runSync(
+    "UPDATE diagnostic_events SET user_status = 'VERIFIED' WHERE event_id = ?;",
+    [eventId]
+  );
+  try {
+    saveUserFeedback({
+      event_id: eventId,
+      user_action: 'VERIFIED',
+      notes,
+      prior_adjustment_applied: false
+    });
+  } catch (e) {
+    // ignore feedback insert error if duplicate
+  }
+  return true;
+}
+
+export function getUserMedicalProfile() {
+  return {
+    userName: getSetting('user_name', 'Wearer'),
+    bloodGroup: getSetting('medical_blood_group', 'Not specified'),
+    conditions: getSetting('medical_conditions', 'None recorded'),
+    allergies: getSetting('medical_allergies', 'None recorded'),
+    instructions: getSetting('medical_instructions', 'Standard emergency protocol')
+  };
+}
+
+export function getVitalsSummary() {
+  const database = initDatabase();
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const startTs = todayStart.getTime();
+
+  const episodeStats = database.getFirstSync(
+    `SELECT 
+       COUNT(*) as total_episodes,
+       AVG(hr_mean) as avg_hr,
+       MIN(hr_min) as min_hr,
+       MAX(hr_max) as max_hr,
+       AVG(spo2_mean) as avg_spo2,
+       MIN(spo2_min) as min_spo2,
+       AVG(temperature_mean) as avg_temp,
+       MAX(heat_index_max) as max_heat_index
+     FROM episodes
+     WHERE start_timestamp >= ?;`,
+    [startTs]
+  );
+
+  const baselinePhys = getBaselineState('physiology', 'global');
+  const restingBaselineHr = baselinePhys && baselinePhys.mean_vector ? baselinePhys.mean_vector[0] : 72;
+  const restingBaselineSpo2 = baselinePhys && baselinePhys.mean_vector ? baselinePhys.mean_vector[1] : 98;
+
+  const recentAlertsCount = database.getFirstSync(
+    `SELECT COUNT(*) as alert_count FROM diagnostic_events 
+     WHERE timestamp >= ? AND severity_tier IN ('advisory', 'urgent');`,
+    [startTs]
+  );
+
+  return {
+    todayEpisodesCount: episodeStats?.total_episodes || 0,
+    avgHr: episodeStats?.avg_hr ? Math.round(episodeStats.avg_hr) : null,
+    minHr: episodeStats?.min_hr ? Math.round(episodeStats.min_hr) : null,
+    maxHr: episodeStats?.max_hr ? Math.round(episodeStats.max_hr) : null,
+    avgSpo2: episodeStats?.avg_spo2 ? Number(episodeStats.avg_spo2.toFixed(1)) : null,
+    minSpo2: episodeStats?.min_spo2 ? Number(episodeStats.min_spo2.toFixed(1)) : null,
+    avgTempC: episodeStats?.avg_temp ? Number(episodeStats.avg_temp.toFixed(1)) : null,
+    baselineRestingHr: Math.round(restingBaselineHr),
+    baselineRestingSpo2: Math.round(restingBaselineSpo2),
+    todayAlertsCount: recentAlertsCount?.alert_count || 0
+  };
+}
+
 // ─── User Feedback API ───────────────────────────────────────────────────────
 
 export function saveUserFeedback(feedback) {
