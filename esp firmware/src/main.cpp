@@ -94,9 +94,9 @@ void setup() {
 
     if (EnvironmentSensor::getInstance().begin()) {
         systemFlags |= (1 << 5);
-        Serial.println("[Setup] BMP280/BME280 Environment sensor initialized.");
+        Serial.println("[Setup] DHT11 Environment sensor initialized.");
     } else {
-        Serial.println("[Setup] Warning: BMP280 initialization failed! Using simulated defaults.");
+        Serial.println("[Setup] Warning: DHT11 initialization failed!");
     }
 
     // 5. Initialize Edge Analytics Engine
@@ -184,7 +184,7 @@ void SamplerTask(void* pvParameters) {
             EdgeAnalytics::getInstance().processVitalSample(vitalSample);
 
             // Mode 1 (BLE ON): Transmit 0x04 Vital Packet @ 100 Hz
-            if (BLEManager::getInstance().isConnected() && vitalSample.fingerDetected) {
+            if (BLEManager::getInstance().isConnected()) {
                 BLEManager::getInstance().sendVitalPacket(nowMs, vitalSample.red, vitalSample.ir, vitalSample.signalQuality);
             }
         }
@@ -258,8 +258,8 @@ void EnvironmentTask(void* pvParameters) {
                           actStr, g_latestImu.ax, g_latestImu.ay, g_latestImu.az, g_latestImu.gx, g_latestImu.gy, g_latestImu.gz);
             Serial.printf("[VITALS] Finger: %-3s | HR: %5.1f bpm | SpO2: %5.1f%% | SignalQuality: %3d%%\n",
                           g_latestVital.fingerDetected ? "YES" : "NO", g_latestVital.heartRate, g_latestVital.spo2, g_latestVital.signalQuality);
-            Serial.printf("[ENV]    Temp: %5.1f°C | Press: %6.1f hPa | Humid: %4.1f%% | HeatIndex: %5.1f°F (%s)\n",
-                          envSample.temperature, envSample.pressure, envSample.humidity, envSample.heatIndexF,
+            Serial.printf("[ENV]    Temp: %5.1f°C | Press: N/A (DHT11) | Humid: %4.1f%% | HeatIndex: %5.1f°F (%s)\n",
+                          envSample.temperature, envSample.humidity, envSample.heatIndexF,
                           envSample.heatIndexF >= HEAT_INDEX_DANGER ? "DANGER" :
                           envSample.heatIndexF >= HEAT_INDEX_EXTREME_CAUTION ? "EXTREME CAUTION" :
                           envSample.heatIndexF >= HEAT_INDEX_CAUTION ? "CAUTION" : "NORMAL");

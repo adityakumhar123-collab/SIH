@@ -56,6 +56,10 @@
 #define I2C_SDA_PIN 27
 #define I2C_SCL_PIN 25
 #define BUZZER_PIN  26
+#define DHT_PIN     33
+#define DHTPIN      33
+#define DHT_TYPE    DHT11
+#define DHTTYPE     DHT11
 
 // Battery ADC read pins
 #define VBAT_CTRL_PIN -1

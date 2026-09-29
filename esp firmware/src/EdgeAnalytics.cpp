@@ -409,7 +409,7 @@ void EdgeAnalytics::evaluateEnvironmentalAnomaly(float tempC, float pressureHpa,
 
     // 3. Normalized Distance for Environment
     float dT = tempC - envCentroid[0];
-    float dP = pressureHpa - envCentroid[1];
+    float dP = (pressureHpa >= PRESS_MIN_HARD_BOUND && pressureHpa <= PRESS_MAX_HARD_BOUND) ? (pressureHpa - envCentroid[1]) : 0.0f;
     float dH = humidityPct - envCentroid[2];
     float varT = fmaxf(envWelford[0].getVariance(), 4.0f);
     float varP = fmaxf(envWelford[1].getVariance(), 25.0f);

@@ -8,11 +8,13 @@
 struct VitalData {
     uint32_t red;
     uint32_t ir;
-    float heartRate;     // in BPM
-    float spo2;          // in %
+    float heartRate;       // in BPM
+    float spo2;            // in %
     uint8_t signalQuality; // 0-100%
     bool fingerDetected;
 };
+
+class MAX30105;
 
 class VitalSensor {
 public:
@@ -23,43 +25,30 @@ public:
 
 private:
     VitalSensor();
-    ~VitalSensor() = default;
+    ~VitalSensor();
 
     VitalSensor(const VitalSensor&) = delete;
     VitalSensor& operator=(const VitalSensor&) = delete;
 
-    static const uint8_t MAX30102_ADDR = 0x57;
-    static const uint8_t REG_INTR_STATUS_1 = 0x00;
-    static const uint8_t REG_INTR_STATUS_2 = 0x01;
-    static const uint8_t REG_INTR_ENABLE_1 = 0x02;
-    static const uint8_t REG_INTR_ENABLE_2 = 0x03;
-    static const uint8_t REG_FIFO_WR_PTR = 0x04;
-    static const uint8_t REG_OVF_COUNTER = 0x05;
-    static const uint8_t REG_FIFO_RD_PTR = 0x06;
-    static const uint8_t REG_FIFO_DATA = 0x07;
-    static const uint8_t REG_FIFO_CONFIG = 0x08;
-    static const uint8_t REG_MODE_CONFIG = 0x09;
-    static const uint8_t REG_SPO2_CONFIG = 0x0A;
-    static const uint8_t REG_LED1_PA = 0x0C; // Red
-    static const uint8_t REG_LED2_PA = 0x0D; // IR
-    static const uint8_t REG_PART_ID = 0xFF;
-
+    MAX30105* maxSensor;
     bool isInitialized;
-    
-    // Rolling statistics for HR & SpO2 estimation
-    uint32_t sampleCount;
-    float irDcEstimate;
-    float redDcEstimate;
-    float irAcEstimate;
-    float redAcEstimate;
-    uint32_t lastPeakTimeMs;
-    float calculatedHr;
-    float calculatedSpo2;
-    float lastFilteredIr;
-    bool peakArm;
+    unsigned long lastInitAttemptMs;
 
-    bool writeRegister(uint8_t reg, uint8_t value);
-    bool readRegisters(uint8_t reg, uint8_t* buffer, uint8_t length);
+    // Buffer for Maxim SpO2 algorithm (100 samples)
+    static const int PPG_BUFFER_LENGTH = 100;
+    uint32_t irBuffer[PPG_BUFFER_LENGTH];
+    uint32_t redBuffer[PPG_BUFFER_LENGTH];
+
+    int32_t spo2;
+    int8_t  validSPO2;
+    int32_t heartRate;
+    int8_t  validHeartRate;
+
+    float lastValidHr;
+    float lastValidSpo2;
+    uint32_t latestRed;
+    uint32_t latestIr;
+    unsigned long lastCalcTimeMs;
 };
 
 #endif // VITAL_SENSOR_H

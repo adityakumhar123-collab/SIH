@@ -1,4 +1,6 @@
 #include "VitalSensor.h"
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
 
 VitalSensor& VitalSensor::getInstance() {
     static VitalSensor instance;
@@ -6,173 +8,150 @@ VitalSensor& VitalSensor::getInstance() {
 }
 
 VitalSensor::VitalSensor()
-    : isInitialized(false)
-    , sampleCount(0)
-    , irDcEstimate(50000.0f)
-    , redDcEstimate(50000.0f)
-    , irAcEstimate(0.0f)
-    , redAcEstimate(0.0f)
-    , lastPeakTimeMs(0)
-    , calculatedHr(72.0f)
-    , calculatedSpo2(98.0f)
-    , lastFilteredIr(0.0f)
-    , peakArm(false) {}
+    : maxSensor(new MAX30105())
+    , isInitialized(false)
+    , lastInitAttemptMs(0)
+    , spo2(-999)
+    , validSPO2(0)
+    , heartRate(-999)
+    , validHeartRate(0)
+    , lastValidHr(72.0f)
+    , lastValidSpo2(98.0f)
+    , latestRed(0)
+    , latestIr(0)
+    , lastCalcTimeMs(0) {
+    for (int i = 0; i < PPG_BUFFER_LENGTH; i++) {
+        redBuffer[i] = 50000;
+        irBuffer[i] = 50000;
+    }
+}
+
+VitalSensor::~VitalSensor() {
+    if (maxSensor) {
+        delete maxSensor;
+        maxSensor = nullptr;
+    }
+}
 
 bool VitalSensor::begin() {
-    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
+    Serial.println("[VitalSensor] Initializing MAX30102 via SparkFun driver...");
 
-    // Check Part ID
-    uint8_t partId = 0;
-    if (!readRegisters(REG_PART_ID, &partId, 1)) {
-        Serial.println("[VitalSensor] Error: Failed to communicate with MAX30102.");
-        isInitialized = false;
-        return false;
+    // Try fast I2C mode (400kHz), fallback to standard (100kHz)
+    if (!maxSensor->begin(Wire, I2C_SPEED_FAST)) {
+        if (!maxSensor->begin(Wire, I2C_SPEED_STANDARD)) {
+            Serial.println("[VitalSensor] Warning: MAX30102 not detected on I2C bus.");
+            isInitialized = false;
+            return false;
+        }
     }
 
-    if (partId != 0x15) {
-        Serial.printf("[VitalSensor] Warning: Unexpected Part ID: 0x%02X (Expected 0x15)\n", partId);
+    // Configure MAX30102:
+    // powerLevel=0x1F, sampleAverage=4, ledMode=2 (Red+IR), sampleRate=400 (100 Hz output), pulseWidth=411, adcRange=4096
+    maxSensor->setup(0x1F, 4, 2, 400, 411, 4096);
+    maxSensor->clearFIFO();
+
+    // Pre-seed buffer with initial samples (timeout 1500ms)
+    unsigned long startPreseed = millis();
+    int count = 0;
+    while (count < PPG_BUFFER_LENGTH && (millis() - startPreseed < 1500)) {
+        maxSensor->check();
+        while (maxSensor->available() && count < PPG_BUFFER_LENGTH) {
+            redBuffer[count] = maxSensor->getRed();
+            irBuffer[count] = maxSensor->getIR();
+            maxSensor->nextSample();
+            count++;
+        }
+        delay(5);
     }
 
-    // Reset sensor
-    writeRegister(REG_MODE_CONFIG, 0x40);
-    delay(100);
-
-    // Configure FIFO: Sample averaging = 4, FIFO roll-on-full = enabled
-    writeRegister(REG_FIFO_CONFIG, 0x4F);
-
-    // Mode: SpO2 mode (Red + IR enabled)
-    writeRegister(REG_MODE_CONFIG, 0x03);
-
-    // SpO2 Config: ADC Range = 4096nA, Sample Rate = 100 Hz, Pulse Width = 411us (18-bit)
-    writeRegister(REG_SPO2_CONFIG, 0x27);
-
-    // LED Current: ~7.2mA for Red and IR (0x24)
-    writeRegister(REG_LED1_PA, 0x24);
-    writeRegister(REG_LED2_PA, 0x24);
-
-    // Clear pointers
-    writeRegister(REG_FIFO_WR_PTR, 0x00);
-    writeRegister(REG_OVF_COUNTER, 0x00);
-    writeRegister(REG_FIFO_RD_PTR, 0x00);
+    if (count > 0) {
+        latestRed = redBuffer[count - 1];
+        latestIr = irBuffer[count - 1];
+        for (int i = count; i < PPG_BUFFER_LENGTH; i++) {
+            redBuffer[i] = latestRed;
+            irBuffer[i] = latestIr;
+        }
+    }
 
     isInitialized = true;
+    lastCalcTimeMs = millis();
     Serial.println("[VitalSensor] MAX30102 initialized successfully at 100 Hz.");
     return true;
 }
 
 bool VitalSensor::readSample(VitalData& data) {
+    unsigned long now = millis();
+
     if (!isInitialized) {
-        // Return dummy healthy vitals if sensor not connected
-        data.red = 60000;
-        data.ir = 65000;
-        data.heartRate = 72.0f;
-        data.spo2 = 98.0f;
-        data.signalQuality = 80;
+        // Attempt background re-initialization every 2 seconds
+        if (now - lastInitAttemptMs >= 2000) {
+            lastInitAttemptMs = now;
+            if (begin()) {
+                isInitialized = true;
+            }
+        }
+        if (!isInitialized) {
+            data.red = 0;
+            data.ir = 0;
+            data.heartRate = 0.0f;
+            data.spo2 = 0.0f;
+            data.signalQuality = 0;
+            data.fingerDetected = false;
+            return false;
+        }
+    }
+
+    // Check FIFO for new samples
+    maxSensor->check();
+
+    while (maxSensor->available()) {
+        latestRed = maxSensor->getRed();
+        latestIr = maxSensor->getIR();
+        maxSensor->nextSample();
+
+        // Shift rolling buffer
+        for (int i = 1; i < PPG_BUFFER_LENGTH; i++) {
+            redBuffer[i - 1] = redBuffer[i];
+            irBuffer[i - 1] = irBuffer[i];
+        }
+        redBuffer[PPG_BUFFER_LENGTH - 1] = latestRed;
+        irBuffer[PPG_BUFFER_LENGTH - 1] = latestIr;
+    }
+
+    // Finger detected if IR count >= 20000
+    bool finger = (latestIr >= 20000);
+
+    if (finger) {
+        // Run Maxim SpO2 & Heart Rate algorithm every 2 seconds when finger is present
+        if (now - lastCalcTimeMs >= 2000) {
+            lastCalcTimeMs = now;
+            maxim_heart_rate_and_oxygen_saturation(
+                irBuffer, PPG_BUFFER_LENGTH, redBuffer,
+                &spo2, &validSPO2, &heartRate, &validHeartRate
+            );
+
+            if (validHeartRate == 1 && heartRate >= 40 && heartRate <= 200) {
+                lastValidHr = (float)heartRate;
+            }
+            if (validSPO2 == 1 && spo2 >= 70 && spo2 <= 100) {
+                lastValidSpo2 = (float)spo2;
+            }
+        }
+
         data.fingerDetected = true;
-        return false;
-    }
-
-    uint8_t rawBytes[6];
-    if (!readRegisters(REG_FIFO_DATA, rawBytes, 6)) {
-        return false;
-    }
-
-    // Extract 18-bit Red and IR readings from FIFO
-    uint32_t rawRed = ((uint32_t)rawBytes[0] << 16) | ((uint32_t)rawBytes[1] << 8) | rawBytes[2];
-    rawRed &= 0x03FFFF;
-
-    uint32_t rawIr = ((uint32_t)rawBytes[3] << 16) | ((uint32_t)rawBytes[4] << 8) | rawBytes[5];
-    rawIr &= 0x03FFFF;
-
-    data.red = rawRed;
-    data.ir = rawIr;
-
-    // Check if finger is placed on sensor (IR baseline threshold)
-    if (rawIr < 20000) {
+        data.red = latestRed;
+        data.ir = latestIr;
+        data.heartRate = lastValidHr;
+        data.spo2 = lastValidSpo2;
+        data.signalQuality = (validHeartRate == 1 || validSPO2 == 1) ? 95 : 75;
+    } else {
         data.fingerDetected = false;
-        data.signalQuality = 0;
+        data.red = latestRed;
+        data.ir = latestIr;
         data.heartRate = 0.0f;
         data.spo2 = 0.0f;
-        return true;
+        data.signalQuality = 0;
     }
 
-    data.fingerDetected = true;
-    sampleCount++;
-
-    // DC baseline tracking using EWMA
-    irDcEstimate = 0.95f * irDcEstimate + 0.05f * (float)rawIr;
-    redDcEstimate = 0.95f * redDcEstimate + 0.05f * (float)rawRed;
-
-    // AC signal extraction (High-pass filtered)
-    float irAc = (float)rawIr - irDcEstimate;
-    float redAc = (float)rawRed - redDcEstimate;
-
-    // Running AC amplitude
-    irAcEstimate = 0.98f * irAcEstimate + 0.02f * fabsf(irAc);
-    redAcEstimate = 0.98f * redAcEstimate + 0.02f * fabsf(redAc);
-
-    // Dynamic peak detection for Heart Rate (100 Hz) with dicrotic notch suppression
-    uint32_t nowMs = millis();
-    float dynamicThreshold = fmaxf(150.0f, 0.45f * irAcEstimate);
-    if (irAc > dynamicThreshold && irAc > lastFilteredIr && !peakArm) {
-        if (lastPeakTimeMs == 0 || (nowMs - lastPeakTimeMs >= 400)) { // Min 400ms refractory period = Max 150 BPM
-            peakArm = true;
-            if (lastPeakTimeMs > 0) {
-                uint32_t deltaMs = nowMs - lastPeakTimeMs;
-                if (deltaMs >= 400 && deltaMs <= 1500) { // 40 BPM to 150 BPM
-                    float instantaneousHr = 60000.0f / (float)deltaMs;
-                    calculatedHr = 0.85f * calculatedHr + 0.15f * instantaneousHr;
-                }
-            }
-            lastPeakTimeMs = nowMs;
-        }
-    } else if (irAc < 0.0f) {
-        peakArm = false;
-    }
-    lastFilteredIr = irAc;
-
-    // SpO2 calculation via Ratio of Ratios: R = (AC_red / DC_red) / (AC_ir / DC_ir)
-    if (irDcEstimate > 1000.0f && redDcEstimate > 1000.0f && irAcEstimate > 10.0f) {
-        float r = (redAcEstimate / redDcEstimate) / (irAcEstimate / irDcEstimate);
-        // Standard empirical calibration curve: SpO2 = 110 - 25 * R
-        float instSpo2 = 110.0f - 25.0f * r;
-        if (instSpo2 > 100.0f) instSpo2 = 100.0f;
-        if (instSpo2 < 70.0f) instSpo2 = 70.0f;
-        calculatedSpo2 = 0.9f * calculatedSpo2 + 0.1f * instSpo2;
-    }
-
-    data.heartRate = calculatedHr;
-    data.spo2 = calculatedSpo2;
-
-    // Signal quality estimate based on AC/DC modulation ratio
-    float snrRatio = (irAcEstimate / irDcEstimate) * 100.0f;
-    uint8_t sq = (uint8_t)fminf(fmaxf(snrRatio * 50.0f, 10.0f), 100.0f);
-    data.signalQuality = sq;
-
-    return true;
-}
-
-bool VitalSensor::writeRegister(uint8_t reg, uint8_t value) {
-    Wire.beginTransmission(MAX30102_ADDR);
-    Wire.write(reg);
-    Wire.write(value);
-    return (Wire.endTransmission() == 0);
-}
-
-bool VitalSensor::readRegisters(uint8_t reg, uint8_t* buffer, uint8_t length) {
-    Wire.beginTransmission(MAX30102_ADDR);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) {
-        return false;
-    }
-
-    uint8_t count = Wire.requestFrom((uint8_t)MAX30102_ADDR, length);
-    if (count != length) {
-        return false;
-    }
-
-    for (uint8_t i = 0; i < length; i++) {
-        buffer[i] = Wire.read();
-    }
     return true;
 }

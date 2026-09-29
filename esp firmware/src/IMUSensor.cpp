@@ -9,55 +9,67 @@ IMUSensor& IMUSensor::getInstance() {
 }
 
 IMUSensor::IMUSensor() 
-    : isInitialized(false) {}
+    : mpuAddr(MPU6050_ADDR_PRIMARY)
+    , isInitialized(false)
+    , lastInitAttemptMs(0) {}
 
 bool IMUSensor::begin() {
-    Serial.println("[IMU] Initializing MPU-6050 via I2C.");
+    Serial.println("[IMU] Initializing MPU-6050 via I2C...");
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    Wire.setTimeOut(100); // 100ms timeout prevents I2C bus lockups during high-G shakes and vibrations
+    Wire.setClock(400000);
+    Wire.setTimeOut(100); // 100ms timeout prevents I2C bus lockups
     
-    // Test connection by reading WHO_AM_I
+    // Try primary address 0x68, then secondary 0x69
     uint8_t whoAmI = 0;
-    if (!readRegisters(REG_WHO_AM_I, &whoAmI, 1)) {
-        Serial.println("[IMU] Error: Failed to read WHO_AM_I register.");
-        return false;
+    mpuAddr = MPU6050_ADDR_PRIMARY;
+    bool found = readRegisters(REG_WHO_AM_I, &whoAmI, 1);
+
+    if (!found || whoAmI == 0x00 || whoAmI == 0xFF) {
+        mpuAddr = MPU6050_ADDR_SECONDARY;
+        found = readRegisters(REG_WHO_AM_I, &whoAmI, 1);
     }
     
-    Serial.print("[IMU] WHO_AM_I: 0x");
-    Serial.println(whoAmI, HEX);
-    
-    if (whoAmI != 0x68 && whoAmI != 0x72 && whoAmI != 0x70) {
-        Serial.println("[IMU] Error: MPU-6050 device signature not recognized.");
+    if (!found || whoAmI == 0x00 || whoAmI == 0xFF) {
+        Serial.println("[IMU] Warning: MPU-6050 not detected at 0x68 or 0x69.");
+        isInitialized = false;
         return false;
     }
+
+    Serial.printf("[IMU] MPU-6050 found at address 0x%02X (WHO_AM_I: 0x%02X).\n", mpuAddr, whoAmI);
     
     // Wake up MPU-6050 (clears SLEEP bit)
     if (!writeRegister(REG_PWR_MGMT_1, 0x00)) {
         Serial.println("[IMU] Error: Failed to wake up sensor.");
+        isInitialized = false;
         return false;
     }
+    delay(10);
     
     // Configure Digital Low Pass Filter (DLPF) to ~44Hz bandwidth
     if (!writeRegister(REG_CONFIG, 0x03)) {
         Serial.println("[IMU] Error: Failed to set DLPF.");
+        isInitialized = false;
         return false;
     }
     
     // Configure Accelerometer to +/- 8g range (4096 LSB/g)
     if (!writeRegister(REG_ACCEL_CONFIG, 0x10)) {
         Serial.println("[IMU] Error: Failed to configure accelerometer range.");
+        isInitialized = false;
         return false;
     }
     
     // Configure Gyroscope to +/- 500 dps range (65.5 LSB/dps)
     if (!writeRegister(REG_GYRO_CONFIG, 0x08)) {
         Serial.println("[IMU] Error: Failed to configure gyroscope range.");
+        isInitialized = false;
         return false;
     }
     
-    // Set Sample Rate Divider to 0 (gives 1 kHz sample rate, which we downsample to 100 Hz by polling at 10ms)
+    // Set Sample Rate Divider to 0 (gives 1 kHz internal sample rate, polled at 100 Hz)
     if (!writeRegister(REG_SMPLRT_DIV, 0x00)) {
         Serial.println("[IMU] Error: Failed to set sample rate divider.");
+        isInitialized = false;
         return false;
     }
     
@@ -67,8 +79,19 @@ bool IMUSensor::begin() {
 }
 
 bool IMUSensor::readSample(IMUData& data) {
+    unsigned long now = millis();
+
     if (!isInitialized) {
-        return false;
+        // Attempt background re-initialization every 2 seconds
+        if (now - lastInitAttemptMs >= 2000) {
+            lastInitAttemptMs = now;
+            if (begin()) {
+                isInitialized = true;
+            }
+        }
+        if (!isInitialized) {
+            return false;
+        }
     }
 
     uint8_t buffer[14];
@@ -80,13 +103,11 @@ bool IMUSensor::readSample(IMUData& data) {
     int16_t rawAx = (buffer[0] << 8) | buffer[1];
     int16_t rawAy = (buffer[2] << 8) | buffer[3];
     int16_t rawAz = (buffer[4] << 8) | buffer[5];
-    // bytes 6-7 contain temperature (unused here)
     int16_t rawGx = (buffer[8] << 8) | buffer[9];
     int16_t rawGy = (buffer[10] << 8) | buffer[11];
     int16_t rawGz = (buffer[12] << 8) | buffer[13];
     
     // Convert to target units using +/- 8g (4096 LSB/g) and +/- 500 dps (65.5 LSB/dps)
-    // Coordinates match: X longitudinal, Y lateral, Z normal
     data.ax = static_cast<float>(rawAx) / 4096.0f;
     data.ay = static_cast<float>(rawAy) / 4096.0f;
     data.az = static_cast<float>(rawAz) / 4096.0f;
@@ -99,10 +120,8 @@ bool IMUSensor::readSample(IMUData& data) {
     float resultant = sqrtf(data.ax*data.ax + data.ay*data.ay + data.az*data.az);
     if (resultant < 0.1f) {
         static uint32_t lastWakeAttempt = 0;
-        uint32_t now = millis();
         if (now - lastWakeAttempt > 1000) {
             lastWakeAttempt = now;
-            Serial.println("[IMU] Warning: Sleep/Glitch detected (resultant < 0.1g). Attempting auto-wake...");
             writeRegister(REG_PWR_MGMT_1, 0x00); // Wake up MPU-6050
             writeRegister(REG_CONFIG, 0x03);      // DLPF
             writeRegister(REG_ACCEL_CONFIG, 0x10);// 8g range
@@ -111,27 +130,24 @@ bool IMUSensor::readSample(IMUData& data) {
         }
     }
 
-    // IMU accelerometer readings are kept in units of g (e.g. 1.0g at rest)
-    // as specified in IMUSensor.h and expected by EdgeAnalytics and BLEManager (which scales by 1000 to mg).
-
     return true;
 }
 
 bool IMUSensor::writeRegister(uint8_t reg, uint8_t value) {
-    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.beginTransmission(mpuAddr);
     Wire.write(reg);
     Wire.write(value);
     return (Wire.endTransmission() == 0);
 }
 
 bool IMUSensor::readRegisters(uint8_t reg, uint8_t* buffer, uint8_t length) {
-    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.beginTransmission(mpuAddr);
     Wire.write(reg);
     if (Wire.endTransmission(false) != 0) {
         return false;
     }
     
-    uint8_t bytesRead = Wire.requestFrom(MPU6050_ADDR, length);
+    uint8_t bytesRead = Wire.requestFrom(mpuAddr, length);
     if (bytesRead != length) {
         return false;
     }
