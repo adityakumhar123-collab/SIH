@@ -17,6 +17,10 @@ VitalSensor::VitalSensor()
     , validHeartRate(0)
     , lastValidHr(72.0f)
     , lastValidSpo2(98.0f)
+    , smoothedHr(-1.0f)
+    , smoothedSpo2(-1.0f)
+    , consecutiveOutliers(0)
+    , hasInitialBaseline(false)
     , latestRed(0)
     , latestIr(0)
     , lastCalcTimeMs(0) {
@@ -109,11 +113,9 @@ bool VitalSensor::readSample(VitalData& data) {
         latestIr = maxSensor->getIR();
         maxSensor->nextSample();
 
-        // Shift rolling buffer
-        for (int i = 1; i < PPG_BUFFER_LENGTH; i++) {
-            redBuffer[i - 1] = redBuffer[i];
-            irBuffer[i - 1] = irBuffer[i];
-        }
+        // Fast buffer shift via memmove
+        memmove(&redBuffer[0], &redBuffer[1], (PPG_BUFFER_LENGTH - 1) * sizeof(uint32_t));
+        memmove(&irBuffer[0], &irBuffer[1], (PPG_BUFFER_LENGTH - 1) * sizeof(uint32_t));
         redBuffer[PPG_BUFFER_LENGTH - 1] = latestRed;
         irBuffer[PPG_BUFFER_LENGTH - 1] = latestIr;
     }
@@ -121,26 +123,95 @@ bool VitalSensor::readSample(VitalData& data) {
     // Finger detection is informational only — does NOT gate the algorithm (per packet_design.md §3.2)
     bool finger = (latestIr >= 20000);
 
-    // Run Maxim built-in algorithm unconditionally every 2 seconds
-    // Algorithm self-signals invalid via validHeartRate/validSPO2 = 0 → we pass -1 to mobile
-    if (now - lastCalcTimeMs >= 2000) {
-        lastCalcTimeMs = now;
-        maxim_heart_rate_and_oxygen_saturation(
-            irBuffer, PPG_BUFFER_LENGTH, redBuffer,
-            &spo2, &validSPO2, &heartRate, &validHeartRate
-        );
-        Serial.printf("[VitalSensor] Maxim: HR=%d (valid=%d) | SpO2=%d (valid=%d) | Finger=%s | IR=%lu\n",
-                      heartRate, validHeartRate, spo2, validSPO2,
-                      finger ? "YES" : "NO", latestIr);
-    }
-
-    // Pass raw Maxim output always — -1 = algorithm is still accumulating / no valid reading
+    // Pass filtered Maxim output (smoothed & artifact-rejected @ 0.5 Hz on Core 0)
     data.fingerDetected = finger;
     data.red            = latestRed;
     data.ir             = latestIr;
-    data.heartRate      = (validHeartRate == 1) ? (float)heartRate : -1.0f;
-    data.spo2           = (validSPO2     == 1) ? (float)spo2      : -1.0f;
-    data.signalQuality  = (validHeartRate == 1 || validSPO2 == 1) ? 95 : (finger ? 50 : 0);
+    data.heartRate      = (hasInitialBaseline && smoothedHr >= 40.0f && smoothedHr <= 180.0f) ? smoothedHr : -1.0f;
+    data.spo2           = (smoothedSpo2 >= 70.0f && smoothedSpo2 <= 100.0f) ? smoothedSpo2 : -1.0f;
+    data.signalQuality  = (hasInitialBaseline) ? 95 : (finger ? 50 : 0);
 
     return true;
+}
+
+// 0.5 Hz Background execution on Core 0 (EnvironmentTask)
+// Runs Maxim algorithm + Physiological Artifact & Slew-Rate Filter + EWMA Temporal Smoothing
+void VitalSensor::updateVitalsCalculation() {
+    if (!isInitialized) return;
+
+    // 1. Finger Contact Gating
+    bool fingerPresent = (latestIr >= 20000);
+    if (!fingerPresent) {
+        // Finger removed -> reset baseline so it recalibrates cleanly upon contact
+        hasInitialBaseline = false;
+        smoothedHr = -1.0f;
+        smoothedSpo2 = -1.0f;
+        validHeartRate = 0;
+        validSPO2 = 0;
+        consecutiveOutliers = 0;
+        return;
+    }
+
+    // 2. Snapshot buffer to run calculation
+    uint32_t localRed[PPG_BUFFER_LENGTH];
+    uint32_t localIr[PPG_BUFFER_LENGTH];
+    memcpy(localRed, (const void*)redBuffer, sizeof(redBuffer));
+    memcpy(localIr, (const void*)irBuffer, sizeof(irBuffer));
+
+    maxim_heart_rate_and_oxygen_saturation(
+        localIr, PPG_BUFFER_LENGTH, localRed,
+        &spo2, &validSPO2, &heartRate, &validHeartRate
+    );
+
+    // 3. Heart Rate Preprocessing & Artifact Filter
+    if (validHeartRate == 1 && heartRate >= 40 && heartRate <= 200) {
+        float rawHr = (float)heartRate;
+
+        if (!hasInitialBaseline) {
+            // First valid calculation: seed the baseline
+            smoothedHr = rawHr;
+            hasInitialBaseline = true;
+            consecutiveOutliers = 0;
+        } else {
+            // A. Harmonic / Sub-harmonic Peak Correction
+            // Dicrotic notch double-counting error (e.g. ~150 BPM when actual is 76 BPM)
+            if (rawHr >= smoothedHr * 1.75f && rawHr <= smoothedHr * 2.25f) {
+                rawHr = rawHr / 2.0f;
+            }
+            // Missed systolic peak half-counting error (e.g. ~38 BPM when actual is 76 BPM)
+            else if (rawHr >= smoothedHr * 0.40f && rawHr <= smoothedHr * 0.60f) {
+                rawHr = rawHr * 2.0f;
+            }
+
+            // B. Slew-Rate Limiter (Physiological Jump Gating)
+            // Human heart rate cannot physically jump > 18 BPM in 2 seconds during steady wear
+            float delta = rawHr - smoothedHr;
+            if (fabsf(delta) > 18.0f) {
+                consecutiveOutliers++;
+                if (consecutiveOutliers < 3) {
+                    // Reject transient motion/contact spike, allow at most ±4 BPM step
+                    rawHr = (delta > 0) ? (smoothedHr + 4.0f) : (smoothedHr - 4.0f);
+                } else {
+                    // Sustained real shift (e.g. sudden workout) -> accept new trend
+                    consecutiveOutliers = 0;
+                }
+            } else {
+                consecutiveOutliers = 0;
+            }
+
+            // C. Clinical EWMA Temporal Smoothing (Alpha = 0.30)
+            smoothedHr = 0.30f * rawHr + 0.70f * smoothedHr;
+        }
+    }
+
+    // 4. SpO2 Temporal Smoothing
+    if (validSPO2 == 1 && spo2 >= 70 && spo2 <= 100) {
+        float rawSpo2 = (float)spo2;
+        if (smoothedSpo2 < 0) {
+            smoothedSpo2 = rawSpo2;
+        } else {
+            // Arterial blood oxygen changes slowly -> EWMA Alpha = 0.20
+            smoothedSpo2 = 0.20f * rawSpo2 + 0.80f * smoothedSpo2;
+        }
+    }
 }

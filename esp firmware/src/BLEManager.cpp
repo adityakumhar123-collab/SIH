@@ -1,6 +1,7 @@
 #include "BLEManager.h"
 #include "EdgeAnalytics.h"
 #include <esp_system.h>
+#include <esp_gap_ble_api.h>
 
 // Connection callbacks
 class BLEServerCallbacksImpl : public BLEServerCallbacks {
@@ -10,19 +11,8 @@ class BLEServerCallbacksImpl : public BLEServerCallbacks {
         BLEManager::getInstance().setStreamingEnabled(true);
     }
 
-    void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) override {
-        Serial.println("[BLE_CB] onConnect (param) triggered. Mode -> BLE ON.");
-        BLEManager::getInstance().setConnected(true);
-        BLEManager::getInstance().setStreamingEnabled(true);
-    }
-
     void onDisconnect(BLEServer* pServer) override {
-        Serial.println("[BLE_CB] onDisconnect triggered. Mode -> BLE OFF (Local Health Sensing).");
-        BLEManager::getInstance().setConnected(false);
-    }
-
-    void onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) override {
-        Serial.println("[BLE_CB] onDisconnect (param) triggered. Mode -> BLE OFF (Local Health Sensing).");
+        Serial.println("[BLE_CB] onDisconnect triggered. Restarting advertising.");
         BLEManager::getInstance().setConnected(false);
     }
 };
@@ -65,8 +55,8 @@ void BLEManager::begin() {
         Serial.printf("[BLE] Warning: Failed to set base MAC address: 0x%x\n", macErr);
     }
 
-    BLEDevice::setMTU(64);
     BLEDevice::init(BLE_DEVICE_NAME);
+    BLEDevice::setMTU(64);
     BLEDevice::setPower(ESP_PWR_LVL_P9);
 
     pServer = BLEDevice::createServer();

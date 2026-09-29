@@ -26,7 +26,8 @@ bool EnvironmentSensor::begin() {
     if (!isnan(t) && !isnan(h) && t > -20.0f && t < 80.0f && h >= 0.0f && h <= 100.0f) {
         cachedTemp = t;
         cachedHumidity = h;
-        cachedHeatIndexF = dht.computeHeatIndex(t, h, false); // Adafruit built-in NOAA Rothfusz (false = °C input → °F output)
+        float tF = (t * 1.8f) + 32.0f;
+        cachedHeatIndexF = dht.computeHeatIndex(tF, h, true); // Adafruit NOAA formula (Fahrenheit in -> Fahrenheit out)
         isInitialized = true;
         lastReadTimeMs = millis();
         Serial.printf("[EnvSensor] DHT11 initialized successfully: Temp=%.1f°C, Hum=%.1f%%, HeatIndex=%.1f°F\n",
@@ -36,7 +37,8 @@ bool EnvironmentSensor::begin() {
 
     // DHT11 might take up to 1-2s to produce its first reading, so mark initialized with nominal values
     isInitialized = true;
-    cachedHeatIndexF = dht.computeHeatIndex(cachedTemp, cachedHumidity, false);
+    float cachedTempF = (cachedTemp * 1.8f) + 32.0f;
+    cachedHeatIndexF = dht.computeHeatIndex(cachedTempF, cachedHumidity, true);
     Serial.println("[EnvSensor] DHT11 started (initial reading pending, will update on next 2s cycle).");
     return true;
 }
@@ -52,7 +54,8 @@ bool EnvironmentSensor::readSample(EnvironmentData& data) {
         if (!isnan(t) && !isnan(h) && t > -40.0f && t < 85.0f && h >= 0.0f && h <= 100.0f) {
             cachedTemp = t;
             cachedHumidity = h;
-            cachedHeatIndexF = dht.computeHeatIndex(t, h, false); // Adafruit built-in NOAA Rothfusz
+            float tF = (t * 1.8f) + 32.0f;
+            cachedHeatIndexF = dht.computeHeatIndex(tF, h, true); // Adafruit NOAA formula (Fahrenheit in -> Fahrenheit out)
             lastReadTimeMs = now;
         } else {
             // Retain previous reading on occasional timing collisions

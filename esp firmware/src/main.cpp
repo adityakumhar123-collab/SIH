@@ -112,10 +112,12 @@ void setup() {
     Serial.printf("[Setup] Free Heap: %d bytes\n", ESP.getFreeHeap());
 
     // Task 1: 100 Hz Sampler Task on Core 1 (High priority)
+    // Stack size 8192: BLE notify() uses ~1.5KB of stack per call, so 4096 causes stack overflow
+    // after ~27 seconds of operation (detectable as watchdog reset / BLE disconnect).
     xTaskCreatePinnedToCore(
         SamplerTask,
         "SamplerTask",
-        4096,
+        8192,
         nullptr,
         10,
         &samplerTaskHandle,
@@ -126,7 +128,7 @@ void setup() {
     xTaskCreatePinnedToCore(
         EnvironmentTask,
         "EnvTask",
-        4096,
+        6144,
         nullptr,
         3,
         &environmentTaskHandle,
@@ -137,7 +139,7 @@ void setup() {
     xTaskCreatePinnedToCore(
         BuzzerTask,
         "BuzzerTask",
-        2048,
+        3072,
         nullptr,
         2,
         &buzzerTaskHandle,
@@ -163,6 +165,10 @@ void SamplerTask(void* pvParameters) {
     Serial.println("[Task] 100 Hz Sampler task active.");
 
     while (1) {
+        TickType_t nowTick = xTaskGetTickCount();
+        if ((nowTick - xLastWakeTime) > (xFrequency * 2)) {
+            xLastWakeTime = nowTick; // Reset schedule if delayed to prevent burst storm
+        }
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
         uint32_t nowMs = millis();
         tickCounter++;
@@ -187,10 +193,12 @@ void SamplerTask(void* pvParameters) {
         if (BLEManager::getInstance().isConnected()) {
             if (imuOk && (tickCounter % 2 == 0)) {
                 BLEManager::getInstance().sendMotionPacket(nowMs, imuSample);
+                taskYIELD();
             } else if (vitalOk) {
                 int16_t hrToSend   = (int16_t)vitalSample.heartRate; // already -1 when invalid
                 int8_t  spo2ToSend = (int8_t)vitalSample.spo2;       // already -1 when invalid
                 BLEManager::getInstance().sendVitalPacket(nowMs, vitalSample.red, vitalSample.ir, hrToSend, spo2ToSend);
+                taskYIELD();
             }
         }
     }
@@ -203,6 +211,7 @@ void EnvironmentTask(void* pvParameters) {
 
     EnvironmentData envSample;
     uint32_t diagCounter = 0;
+    uint8_t vitalCalcCounter = 0;
 
     Serial.println("[Task] 1 Hz Environment & Diagnostics task active.");
 
@@ -210,9 +219,17 @@ void EnvironmentTask(void* pvParameters) {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
         uint32_t nowMs = millis();
 
-        // 1. Read Environment Sensor (BMP280 / BME280)
+        // 1. Read Environment Sensor (DHT11)
         EnvironmentSensor::getInstance().readSample(envSample);
         g_latestEnv = envSample;
+
+        // 2. Run Maxim Heart Rate & SpO2 calculation every 2 seconds on Core 0
+        // Runs in background to keep 100 Hz SamplerTask on Core 1 completely real-time
+        vitalCalcCounter++;
+        if (vitalCalcCounter >= 2) {
+            vitalCalcCounter = 0;
+            VitalSensor::getInstance().updateVitalsCalculation();
+        }
 
         // Ingest into Edge Analytics Engine
         EdgeAnalytics::getInstance().processEnvironmentSample(envSample);

@@ -129,7 +129,7 @@ export default function SignalsCard({
             </View>
           </View>
           <Text style={cardStyles.tileValue}>
-            {isHrValid ? hr : (isHrCalculating ? 'Calc...' : '--')}{' '}
+            {isHrValid ? Math.round(hr) : (isHrCalculating ? 'Calc...' : '--')}{' '}
             <Text style={cardStyles.tileUnit}>BPM</Text>
           </Text>
           <Text style={cardStyles.tileSubtext}>

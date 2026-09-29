@@ -146,6 +146,14 @@ export default function useBle(activeTab, addLog) {
   // Any BLE-level error message to display in the UI (e.g. "Connection failed")
   const [bleError, setBleError] = useState(null);
 
+  // --- Auto-Reconnect State ---
+  // Stores the last successfully connected device ID so we can auto-reconnect on unexpected drops.
+  const lastConnectedDeviceIdRef = useRef(null);
+  const isReconnectingRef = useRef(false); // prevents multiple simultaneous reconnect attempts
+  const isConnectingRef = useRef(false);   // mutex to prevent concurrent connection attempts
+  const disconnectSubscriptionRef = useRef(null); // manages onDeviceDisconnected subscription
+  const reconnectTimerRef = useRef(null); // manages scheduled reconnect timeout
+
   // --- SafeBand Device State (updated from STATUS and FEATURE packets) ---
   const [wearConfidence, setWearConfidence] = useState(100); // % — 0 = unworn
   const [batteryPct, setBatteryPct] = useState(98);          // % battery remaining
@@ -430,6 +438,10 @@ export default function useBle(activeTab, addLog) {
   const addLogRef = useRef(addLog);
   addLogRef.current = addLog;
 
+  // connectToDeviceRef: allows the auto-reconnect setTimeout to call the latest version
+  // of connectToDevice without capturing a stale closure from the initial render.
+  const connectToDeviceRef = useRef(null); // initialized after connectToDevice is defined below
+
   // =============================================================================
   // BLE Scanning
   // Starts scanning for nearby BLE devices advertising the SafeBand service UUID.
@@ -522,6 +534,17 @@ export default function useBle(activeTab, addLog) {
   //  11. Register disconnect handler to clean up state if connection drops
   // =============================================================================
   const connectToDevice = async (deviceId) => {
+    if (isConnectingRef.current) {
+      console.log('[BLE] Connection skipped: Connection already in progress.');
+      return;
+    }
+    isConnectingRef.current = true;
+
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+
     stopScanning();
     setConnectionState('CONNECTING');
     setBleError(null);
@@ -657,6 +680,9 @@ export default function useBle(activeTab, addLog) {
 
       let monitoredCount = 0;
       for (const { uuid, name } of NOTIFY_TARGETS) {
+        // Stagger CCCD descriptor writes to prevent GATT_BUSY / handshake aborts on Android
+        await new Promise((r) => setTimeout(r, 100));
+
         const char = charByUUID[uuid.toLowerCase()];
         const helper = makeNotifyHandler(name);
         if (char) {
@@ -681,12 +707,27 @@ export default function useBle(activeTab, addLog) {
       console.log(`[BLE] Connected. Monitoring ${monitoredCount}/3 characteristics (STATUS, SENSOR, FEATURE).`);
       addLog(`Connected. Monitoring ${monitoredCount}/3 characteristics (STATUS, SENSOR, FEATURE).`, 'SYSTEM');
 
+      // Record the device ID for auto-reconnect on unexpected drop
+      lastConnectedDeviceIdRef.current = deviceId;
+
       // Do not auto-start high-rate sensor streaming on connect to prevent flooding the BLE link
       // and causing early disconnections. The user can toggle streaming manually.
       setIsStreaming(false);
 
+      // Clean up any previous disconnect subscription
+      if (disconnectSubscriptionRef.current) {
+        try {
+          disconnectSubscriptionRef.current.remove();
+        } catch (_) {}
+        disconnectSubscriptionRef.current = null;
+      }
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+
       // Register disconnect handler: cleans up state if device drops connection unexpectedly
-      bleManagerRef.current.onDeviceDisconnected(deviceId, (error, d) => {
+      disconnectSubscriptionRef.current = bleManagerRef.current.onDeviceDisconnected(deviceId, (error, d) => {
         console.log('[BLE] Device disconnected on connection loss.');
         setActiveDevice(null);
         setConnectionState('DISCONNECTED');
@@ -710,17 +751,55 @@ export default function useBle(activeTab, addLog) {
           motionEmbedding: new Array(32).fill(0),
         });
         addLog('Device disconnected. Sensor telemetry and threat monitoring reset to IDLE.', 'SYSTEM');
+
+        // Auto-reconnect: after an unexpected drop, retry the same device after 3 seconds.
+        // The ESP32 restarts advertising immediately after a disconnect.
+        const savedDeviceId = lastConnectedDeviceIdRef.current;
+        if (savedDeviceId && !isReconnectingRef.current) {
+          isReconnectingRef.current = true;
+          addLog('Auto-reconnect scheduled in 3s...', 'SYSTEM');
+          if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = setTimeout(async () => {
+            isReconnectingRef.current = false;
+            reconnectTimerRef.current = null;
+            // Only reconnect if still not manually connected by the user
+            if (lastConnectedDeviceIdRef.current === savedDeviceId) {
+              addLog(`Auto-reconnecting to ${savedDeviceId}...`, 'SYSTEM');
+              try {
+                await connectToDeviceRef.current(savedDeviceId);
+              } catch (reconnectErr) {
+                console.warn('[BLE] Auto-reconnect failed:', reconnectErr.message);
+                addLogRef.current(`Auto-reconnect failed: ${reconnectErr.message}`, 'SYSTEM');
+              }
+            }
+          }, 3000);
+        }
       });
 
     } catch (err) {
       console.error('[BLE] Connection error:', err);
       setBleError(err.message || 'Connection failed.');
       setConnectionState('DISCONNECTED');
+    } finally {
+      isConnectingRef.current = false;
     }
   };
+  connectToDeviceRef.current = connectToDevice;
 
   // Gracefully disconnects from the active device and resets all connection state
   const handleDisconnect = async () => {
+    lastConnectedDeviceIdRef.current = null;
+    isReconnectingRef.current = false;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    if (disconnectSubscriptionRef.current) {
+      try {
+        disconnectSubscriptionRef.current.remove();
+      } catch (_) {}
+      disconnectSubscriptionRef.current = null;
+    }
     if (activeDevice) {
       try {
         await activeDevice.cancelConnection();

@@ -22,6 +22,7 @@ public:
 
     bool begin();
     bool readSample(VitalData& data);
+    void updateVitalsCalculation();
 
 private:
     VitalSensor();
@@ -46,6 +47,10 @@ private:
 
     float lastValidHr;
     float lastValidSpo2;
+    float smoothedHr;
+    float smoothedSpo2;
+    uint8_t consecutiveOutliers;
+    bool hasInitialBaseline;
     uint32_t latestRed;
     uint32_t latestIr;
     unsigned long lastCalcTimeMs;
