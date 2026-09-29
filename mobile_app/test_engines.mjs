@@ -141,14 +141,15 @@ async function runAllTests() {
     `Classified activity as: '${activityClass}' (Confidence: ${(confidence * 100).toFixed(1)}%).`
   );
 
-  // MAX30102 PPG waveform pulse test
+  // MAX30102 PPG waveform pulse test: Mobile extracts 3 vital features (Morphology, HRV, cBP)
+  // while HR and SpO2 are computed on firmware by Maxim algorithm
   const syntheticRed = Array.from({ length: 200 }, (_, i) => 25000 + 500 * Math.sin(2 * Math.PI * 1.2 * (i / 100)));
   const syntheticIr = Array.from({ length: 200 }, (_, i) => 28000 + 1200 * Math.sin(2 * Math.PI * 1.2 * (i / 100)));
   const ppgResult = processPpgWaveform(syntheticRed, syntheticIr);
   logResult(
-    "MAX30102 PPG Pulse Extraction",
-    ppgResult.hr > 50 && ppgResult.hr < 120 && ppgResult.spo2 >= 90,
-    `Computed HR: ${ppgResult.hr} BPM, SpO2: ${ppgResult.spo2.toFixed(1)}%, HRV: ${ppgResult.hrv.toFixed(1)} ms.`
+    "MAX30102 PPG Client DSP Extraction (Morphology, HRV, cBP)",
+    ppgResult.arterialStiffness !== undefined && ppgResult.vascularAge !== undefined && ppgResult.cBP !== undefined && ppgResult.hr === 0,
+    `Stiffness: ${ppgResult.arterialStiffness}, V-Age: ${ppgResult.vascularAge}y, cBP: ${ppgResult.cBP.sys}/${ppgResult.cBP.dia} mmHg (HR/SpO2 assigned from firmware).`
   );
 
   // NOAA Heat Index Rothfusz test

@@ -89,8 +89,6 @@
 // Hard Bounds: Environment
 #define TEMP_MIN_HARD_BOUND     -10.0f // deg C
 #define TEMP_MAX_HARD_BOUND     60.0f  // deg C
-#define PRESS_MIN_HARD_BOUND    700.0f // hPa
-#define PRESS_MAX_HARD_BOUND    1100.0f// hPa
 #define HUMID_MIN_HARD_BOUND    0.0f   // %
 #define HUMID_MAX_HARD_BOUND    100.0f // %
 #define DEFAULT_DUMMY_HUMIDITY  50.0f  // Fallback % RH

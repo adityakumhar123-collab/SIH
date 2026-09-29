@@ -111,9 +111,9 @@ private:
     float vitalCentroid[2];
     WelfordStat vitalWelford[2];
 
-    // N-Dimensional Environment Baseline (3D: Temp, Pressure, Humidity)
-    float envCentroid[3];
-    WelfordStat envWelford[3];
+    // N-Dimensional Environment Baseline (2D: Temp, Humidity)
+    float envCentroid[2];
+    WelfordStat envWelford[2];
 
     // Helper math functions
     static float clamp01(float x);
@@ -124,7 +124,7 @@ private:
     void evaluateMotionWindow();
     void evaluateFallDetection(const IMUData& sample);
     void evaluatePhysiologicalAnomaly(float hr, float spo2);
-    void evaluateEnvironmentalAnomaly(float tempC, float pressureHpa, float humidityPct, float heatIndexF);
+    void evaluateEnvironmentalAnomaly(float tempC, float humidityPct, float heatIndexF);
 };
 
 #endif // EDGE_ANALYTICS_H

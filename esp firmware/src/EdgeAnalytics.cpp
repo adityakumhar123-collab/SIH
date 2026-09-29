@@ -56,13 +56,11 @@ void EdgeAnalytics::begin() {
     vitalWelford[0].reset(72.0f, 100.0f); // sigma^2 = 100 (std = 10 bpm)
     vitalWelford[1].reset(98.0f, 4.0f);   // sigma^2 = 4 (std = 2%)
 
-    // 3. Initialize Environment Baseline [Temp °C, Pressure hPa, Humidity %]
+    // 3. Initialize Environment Baseline [Temp °C, Humidity %]
     envCentroid[0] = 25.0f;
-    envCentroid[1] = 1013.25f;
-    envCentroid[2] = 50.0f;
+    envCentroid[1] = 50.0f;
     envWelford[0].reset(25.0f, 16.0f);    // sigma^2 = 16 (std = 4°C)
-    envWelford[1].reset(1013.25f, 100.0f);// sigma^2 = 100 (std = 10 hPa)
-    envWelford[2].reset(50.0f, 100.0f);   // sigma^2 = 100 (std = 10%)
+    envWelford[1].reset(50.0f, 100.0f);   // sigma^2 = 100 (std = 10%)
 
     Serial.println("[EdgeAnalytics] Initialized with seeded centroids and Welford variance baselines.");
 }
@@ -378,10 +376,10 @@ void EdgeAnalytics::evaluatePhysiologicalAnomaly(float hr, float spo2) {
 }
 
 void EdgeAnalytics::processEnvironmentSample(const EnvironmentData& sample) {
-    evaluateEnvironmentalAnomaly(sample.temperature, sample.pressure, sample.humidity, sample.heatIndexF);
+    evaluateEnvironmentalAnomaly(sample.temperature, sample.humidity, sample.heatIndexF);
 }
 
-void EdgeAnalytics::evaluateEnvironmentalAnomaly(float tempC, float pressureHpa, float humidityPct, float heatIndexF) {
+void EdgeAnalytics::evaluateEnvironmentalAnomaly(float tempC, float humidityPct, float heatIndexF) {
     // 1. NOAA Heat Index Hazard Check
     if (heatIndexF >= HEAT_INDEX_DANGER) { // >= 104°F Danger or Extreme Danger
         static uint32_t lastHeatAlertMs = 0;
@@ -398,25 +396,19 @@ void EdgeAnalytics::evaluateEnvironmentalAnomaly(float tempC, float pressureHpa,
         envCentroid[0] = EWMA_ALPHA_ENVIRONMENT * tempC + (1.0f - EWMA_ALPHA_ENVIRONMENT) * envCentroid[0];
         envWelford[0].update(tempC);
     }
-    if (pressureHpa >= PRESS_MIN_HARD_BOUND && pressureHpa <= PRESS_MAX_HARD_BOUND) {
-        envCentroid[1] = EWMA_ALPHA_ENVIRONMENT * pressureHpa + (1.0f - EWMA_ALPHA_ENVIRONMENT) * envCentroid[1];
-        envWelford[1].update(pressureHpa);
-    }
     if (humidityPct >= HUMID_MIN_HARD_BOUND && humidityPct <= HUMID_MAX_HARD_BOUND) {
-        envCentroid[2] = EWMA_ALPHA_ENVIRONMENT * humidityPct + (1.0f - EWMA_ALPHA_ENVIRONMENT) * envCentroid[2];
-        envWelford[2].update(humidityPct);
+        envCentroid[1] = EWMA_ALPHA_ENVIRONMENT * humidityPct + (1.0f - EWMA_ALPHA_ENVIRONMENT) * envCentroid[1];
+        envWelford[1].update(humidityPct);
     }
 
-    // 3. Normalized Distance for Environment
+    // 3. Normalized Distance for Environment (2-DOF: Temp, Humidity)
     float dT = tempC - envCentroid[0];
-    float dP = (pressureHpa >= PRESS_MIN_HARD_BOUND && pressureHpa <= PRESS_MAX_HARD_BOUND) ? (pressureHpa - envCentroid[1]) : 0.0f;
-    float dH = humidityPct - envCentroid[2];
+    float dH = humidityPct - envCentroid[1];
     float varT = fmaxf(envWelford[0].getVariance(), 4.0f);
-    float varP = fmaxf(envWelford[1].getVariance(), 25.0f);
-    float varH = fmaxf(envWelford[2].getVariance(), 25.0f);
+    float varH = fmaxf(envWelford[1].getVariance(), 25.0f);
 
-    float envDistSq = (dT * dT) / varT + (dP * dP) / varP + (dH * dH) / varH;
-    if (envDistSq > 11.34f) { // chi-square 3-DOF at 99% significance
+    float envDistSq = (dT * dT) / varT + (dH * dH) / varH;
+    if (envDistSq > 9.21f) { // chi-square 2-DOF at 99% significance
         static uint32_t lastEnvDistAlertMs = 0;
         if (millis() - lastEnvDistAlertMs > 20000) {
             lastEnvDistAlertMs = millis();

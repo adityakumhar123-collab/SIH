@@ -12,7 +12,7 @@
 // ---------------------------------
 // - Motion: Ingests 6-DoF IMU [ax, ay, az, gx, gy, gz] samples at 100 Hz via pushMotionSample().
 // - Photoplethysmography (PPG): Ingests raw Red and Infrared optical sensor counts at 100 Hz.
-// - Environmental: Ingests ambient Temperature (°C), Relative Humidity (%), and Pressure (hPa) at 1 Hz.
+// - Environmental: Ingests ambient Temperature (°C) and Relative Humidity (%) at 1 Hz via DHT11.
 //
 // SLIDING WINDOW & STRIDE MATH:
 // -----------------------------
@@ -49,8 +49,7 @@ import {
   standardizeFeatures,
   classifyEmbedding,
   generateFallbackEmbedding,
-  processPpgWaveform,
-  computeHeatIndex
+  processPpgWaveform
 } from './FeatureExtraction.js';
 import { MathematicalEngine } from './MathematicalEngine.js';
 import { DiagnosticReasoningEngine } from './DiagnosticReasoningEngine.js';
@@ -63,7 +62,7 @@ class EpisodeEngineClass {
     this.imuBuffer = [];       // Array of [ax, ay, az, gx, gy, gz] samples (100 Hz)
     this.redBuffer = [];       // Raw Red channel samples (100 Hz)
     this.irBuffer = [];        // Raw IR channel samples (100 Hz)
-    this.latestEnv = { tempC: 24.0, pressHpa: 1013.25, humPct: 50.0 };
+    this.latestEnv = { tempC: 24.0, humPct: 50.0, heatIndexF: 75.0 };
 
     this.WINDOW_SIZE = 200;    // 2.0s window @ 100 Hz
     this.STRIDE_SIZE = 50;     // 0.5s stride @ 100 Hz = 2.0 Hz inference tick
@@ -78,8 +77,10 @@ class EpisodeEngineClass {
     this.accelRmsAccumulator = [];
 
     // Current real-time state exposed to UI and ContextEngine
-    this.currentVitals = { hr: 72, spo2: 98.0, hrv: 45.0 };
-    this.currentHeatIndex = { heatIndexF: 75.0, tier: 'NORMAL', riskLevel: 0 };
+    this.latestFirmwareHr = -1;
+    this.latestFirmwareSpo2 = -1;
+    this.currentVitals = { hr: -1, spo2: -1, hrv: 0, arterialStiffness: 0, vascularAge: 0, pttMs: 0, cBP: { sys: 0, dia: 0 } };
+    this.currentHeatIndex = { heatIndexF: 75.0, heatIndexC: 23.9, tier: 'NORMAL', riskLevel: 0 };
     this.currentActivity = { activityClass: 'standing', confidence: 1.0 };
     this.currentDiagnostic = null;
     this.anomalyPersistenceMinutes = 0;
@@ -200,19 +201,42 @@ class EpisodeEngineClass {
     }
   }
 
-  // Ingest raw 100 Hz Vital Sample (red, ir)
-  pushVitalSample(red, ir) {
+  // Ingest raw 100 Hz Vital Sample (red, ir, heartRate, spo2)
+  pushVitalSample(red, ir, heartRate = -1, spo2 = -1) {
     this.redBuffer.push(red);
     this.irBuffer.push(ir);
     if (this.redBuffer.length > 400) {
       this.redBuffer.shift();
       this.irBuffer.shift();
     }
+    if (heartRate !== undefined && heartRate !== null) {
+      this.latestFirmwareHr = heartRate;
+    }
+    if (spo2 !== undefined && spo2 !== null) {
+      this.latestFirmwareSpo2 = spo2;
+    }
   }
 
-  // Ingest 1 Hz Environment Reading (tempC, pressHpa, humPct)
-  pushEnvironmentSample(tempC, pressHpa, humPct) {
-    this.latestEnv = { tempC, pressHpa, humPct };
+  // Ingest 1 Hz Environment Reading (tempC, humPct, heatIndexF)
+  pushEnvironmentSample(tempC, humPct, heatIndexF = null) {
+    this.latestEnv = {
+      tempC,
+      humPct,
+      heatIndexF: heatIndexF !== null ? heatIndexF : this.latestEnv.heatIndexF
+    };
+    const hiF = this.latestEnv.heatIndexF;
+    let tier = 'NORMAL';
+    let riskLevel = 0;
+    if (hiF >= 125.0) { tier = 'EXTREME_DANGER'; riskLevel = 4; }
+    else if (hiF >= 104.0) { tier = 'DANGER'; riskLevel = 3; }
+    else if (hiF >= 91.0) { tier = 'EXTREME_CAUTION'; riskLevel = 2; }
+    else if (hiF >= 80.0) { tier = 'CAUTION'; riskLevel = 1; }
+    this.currentHeatIndex = {
+      heatIndexF: Number(hiF.toFixed(1)),
+      heatIndexC: Number((((hiF - 32.0) * 5.0) / 9.0).toFixed(1)),
+      tier,
+      riskLevel
+    };
   }
 
   /**
@@ -249,14 +273,42 @@ class EpisodeEngineClass {
     const { activityClass, confidence } = classifyEmbedding(embedding);
     this.currentActivity = { activityClass, confidence };
 
-    // 4. PPG Waveform Processing (Heart Rate, SpO2 via AC/DC ratio, HRV RMSSD)
-    const ppg = processPpgWaveform(this.redBuffer, this.irBuffer);
-    if (ppg.hr > 0) {
-      this.currentVitals = { hr: ppg.hr, spo2: ppg.spo2, hrv: ppg.hrv };
-    }
+    // 4. Mobile Client DSP Features (ONLY Morphology, HRV, and cBP):
+    //    - PPG Waveform Morphology (Arterial Stiffness & Vascular Age)
+    //    - HRV (RMSSD)
+    //    - Continuous Blood Pressure (cBP via IMU+PPG Pulse Transit Time)
+    // HR and SpO2 are computed on ESP32 firmware by the Maxim algorithm (packet_design.md §3.2)
+    const ppg = processPpgWaveform(this.redBuffer, this.irBuffer, window);
+    this.currentVitals = {
+      ...ppg,
+      hr: this.latestFirmwareHr,
+      spo2: this.latestFirmwareSpo2
+    };
 
-    // 5. Environmental Heat Index (NOAA Rothfusz regression equation)
-    const heat = computeHeatIndex(this.latestEnv.tempC, this.latestEnv.humPct);
+    // 5. Environmental Heat Index: Computed by ESP32 firmware Adafruit DHT built-in (computeHeatIndex)
+    const heatF = this.latestEnv.heatIndexF !== undefined ? this.latestEnv.heatIndexF : 75.0;
+    const heatC = ((heatF - 32.0) * 5.0) / 9.0;
+    let tier = 'NORMAL';
+    let riskLevel = 0;
+    if (heatF >= 125.0) {
+      tier = 'EXTREME_DANGER';
+      riskLevel = 4;
+    } else if (heatF >= 104.0) {
+      tier = 'DANGER';
+      riskLevel = 3;
+    } else if (heatF >= 91.0) {
+      tier = 'EXTREME_CAUTION';
+      riskLevel = 2;
+    } else if (heatF >= 80.0) {
+      tier = 'CAUTION';
+      riskLevel = 1;
+    }
+    const heat = {
+      heatIndexF: Number(heatF.toFixed(1)),
+      heatIndexC: Number(heatC.toFixed(1)),
+      tier,
+      riskLevel
+    };
     this.currentHeatIndex = heat;
 
     // 6. Update Location Engine with latest vitals context
@@ -264,7 +316,7 @@ class EpisodeEngineClass {
       LocationEngine.onLocationUpdate(LocationEngine.currentGps, {
         tempC: this.latestEnv.tempC,
         humidityPct: this.latestEnv.humPct,
-        restingHr: this.currentVitals.hr
+        restingHr: this.currentVitals.hr > 0 ? this.currentVitals.hr : 72
       });
     }
 
@@ -282,13 +334,16 @@ class EpisodeEngineClass {
     const eigenvalueRatio = globRaw[3]; // Linearity feature (1.0 = single axis, 0.0 = spherical)
 
     // 8. Mathematical Engine Mahalanobis Baselines
+    // Use valid vitals if available (> 0), or default healthy baseline [72, 98] during initialization
+    const evalHr = this.currentVitals.hr > 0 ? this.currentVitals.hr : 72.0;
+    const evalSpo2 = this.currentVitals.spo2 > 0 ? this.currentVitals.spo2 : 98.0;
     const physEval = MathematicalEngine.evaluateDomain(
       'physiology',
-      [this.currentVitals.hr, this.currentVitals.spo2]
+      [evalHr, evalSpo2]
     );
     const envEval = MathematicalEngine.evaluateDomain(
       'environment',
-      [this.latestEnv.tempC, this.latestEnv.humPct, this.latestEnv.pressHpa]
+      [this.latestEnv.tempC, this.latestEnv.humPct]
     );
 
     // Track anomaly duration (persistence minutes)
@@ -443,7 +498,6 @@ class EpisodeEngineClass {
       spo2_variance: 0.0,
       temperature_mean: this.latestEnv.tempC,
       humidity_mean: this.latestEnv.humPct,
-      pressure_mean: this.latestEnv.pressHpa,
       heat_index_mean: this.currentHeatIndex.heatIndexF,
       heat_index_max: this.currentHeatIndex.heatIndexF,
       accel_rms_mean: 9.8,

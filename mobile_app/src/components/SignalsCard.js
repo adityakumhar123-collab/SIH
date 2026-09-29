@@ -41,22 +41,37 @@ export default function SignalsCard({
   connectionState = 'CONNECTED'
 }) {
   const isConnected = connectionState === 'CONNECTED';
-  const hasVitals = isConnected && wearConfidence > 40 && currentPacket.hr > 0 && currentPacket.spo2 > 0;
 
-  // 1. Physiological Vitals
-  const hr = currentPacket.hr || 0;
+  // 1. Physiological Vitals (Directly from Firmware Maxim Algorithm)
+  const hr = currentPacket.hr !== undefined ? currentPacket.hr : 0;
   const spo2 = currentPacket.spo2 !== undefined ? currentPacket.spo2 : 0;
-  const hrv = currentPacket.hrv !== undefined ? currentPacket.hrv : 45.0;
+  // hrv: computed by mobile PPG peak DSP; 0 means buffer still filling
+  const hrv = currentPacket.hrv !== undefined ? currentPacket.hrv : 0;
 
-  // 2. Environmental & Atmospheric Metrics
+  const isHrCalculating = hr === -1;
+  const isHrValid = hr > 0;
+  const isSpo2Calculating = spo2 === -1;
+  const isSpo2Valid = spo2 > 0;
+  const hasVitals = isConnected && isHrValid && isSpo2Valid;
+  // HRV is valid once the PPG RMSSD pipeline has produced a non-zero value
+  const isHrvValid = hrv > 0;
+  const isHrvAcquiring = isConnected && !isHrvValid;
+
+  // 2. Environmental & Atmospheric Metrics (Directly from Firmware DHT Sensor)
   const tempC = currentPacket.tempC !== undefined ? currentPacket.tempC : 24.0;
   const tempF = (tempC * 9) / 5 + 32;
   const humPct = currentPacket.humidityPct !== undefined ? currentPacket.humidityPct : 50.0;
-  const pressHpa = currentPacket.pressureHpa !== undefined ? currentPacket.pressureHpa : 1013.2;
+  // vascularAge is 0 until PPG morphology pipeline accumulates enough pulses
+  const vascularAge = currentPacket.vascularAge || 0;
+  const stiffness = currentPacket.arterialStiffness || 0;
+  const cBP = currentPacket.cBP || { sys: 0, dia: 0 };
+  const hasVascularData = vascularAge > 0 && stiffness > 0;
 
-  // 3. NOAA Heat Index
+  // 3. NOAA Heat Index (Directly from Firmware DHT built-in computeHeatIndex)
   const heatF = currentPacket.heatIndexF !== undefined ? currentPacket.heatIndexF : tempF;
-  const heatC = ((heatF - 32) * 5) / 9;
+  // Prevent floating-point signed zero: -0 occurs when heatF is exactly 32.0
+  const heatCRaw = ((heatF - 32) * 5) / 9;
+  const heatC = Object.is(heatCRaw, -0) ? 0 : heatCRaw;
   const heatTierKey = currentPacket.heatIndexTier || 'NORMAL';
   const heatMeta = HEAT_TIERS[heatTierKey] || HEAT_TIERS.NORMAL;
 
@@ -64,12 +79,26 @@ export default function SignalsCard({
   const peakAccel = currentPacket.peakAccel || 1000;
   const isWorn = wearConfidence > 40;
 
-  // Clinical Vitals Classifications (NEWS2 standards)
-  const hrStatusColor = !hasVitals ? '#64748B' : hr > 115 ? '#EF4444' : hr > 100 ? '#F59E0B' : hr < 50 ? '#F59E0B' : '#10B981';
-  const hrStatusText = !hasVitals ? (isConnected ? 'Unworn' : 'Offline') : hr > 100 ? 'Elevated' : hr < 50 ? 'Low' : 'Normal';
+  // Honest Clinical Vitals Classifications
+  let hrStatusColor = '#64748B';
+  let hrStatusText = isConnected ? 'No Signal' : 'Offline';
+  if (isHrCalculating) {
+    hrStatusColor = '#F59E0B';
+    hrStatusText = 'Calculating';
+  } else if (isHrValid) {
+    hrStatusColor = hr > 115 ? '#EF4444' : hr > 100 ? '#F59E0B' : hr < 50 ? '#F59E0B' : '#10B981';
+    hrStatusText = hr > 100 ? 'Elevated' : hr < 50 ? 'Low' : 'Normal';
+  }
 
-  const spo2StatusColor = !hasVitals ? '#64748B' : spo2 < 90 ? '#EF4444' : spo2 < 94 ? '#F59E0B' : '#10B981';
-  const spo2StatusText = !hasVitals ? (isConnected ? 'Unworn' : 'Offline') : spo2 < 90 ? 'Critical' : spo2 < 94 ? 'Low' : 'Optimal';
+  let spo2StatusColor = '#64748B';
+  let spo2StatusText = isConnected ? 'No Signal' : 'Offline';
+  if (isSpo2Calculating) {
+    spo2StatusColor = '#F59E0B';
+    spo2StatusText = 'Calculating';
+  } else if (isSpo2Valid) {
+    spo2StatusColor = spo2 < 90 ? '#EF4444' : spo2 < 94 ? '#F59E0B' : '#10B981';
+    spo2StatusText = spo2 < 90 ? 'Critical' : spo2 < 94 ? 'Low' : 'Optimal';
+  }
 
   const humStatusText = humPct < 30 ? 'Dry' : humPct > 70 ? 'Humid' : 'Optimal';
   const humStatusColor = humPct < 30 ? '#F59E0B' : humPct > 70 ? '#38BDF8' : '#10B981';
@@ -100,10 +129,12 @@ export default function SignalsCard({
             </View>
           </View>
           <Text style={cardStyles.tileValue}>
-            {hasVitals ? hr : '--'}{' '}
+            {isHrValid ? hr : (isHrCalculating ? 'Calc...' : '--')}{' '}
             <Text style={cardStyles.tileUnit}>BPM</Text>
           </Text>
-          <Text style={cardStyles.tileSubtext}>Resting range: 60-100</Text>
+          <Text style={cardStyles.tileSubtext}>
+            {isHrValid ? 'Firmware Maxim algorithm' : (isHrCalculating ? 'Maxim acquiring optical buffer' : 'Resting range: 60-100')}
+          </Text>
         </View>
 
         {/* Tile 2: SpO2 */}
@@ -115,25 +146,31 @@ export default function SignalsCard({
             </View>
           </View>
           <Text style={cardStyles.tileValue}>
-            {hasVitals ? spo2.toFixed(0) : '--'}{' '}
+            {isSpo2Valid ? Math.round(spo2) : (isSpo2Calculating ? 'Calc...' : '--')}{' '}
             <Text style={cardStyles.tileUnit}>%</Text>
           </Text>
-          <Text style={cardStyles.tileSubtext}>Clinical target: ≥ 95%</Text>
+          <Text style={cardStyles.tileSubtext}>
+            {isSpo2Valid ? 'Firmware Maxim algorithm' : (isSpo2Calculating ? 'Maxim acquiring optical buffer' : 'Clinical target: ≥ 95%')}
+          </Text>
         </View>
 
         {/* Tile 3: HRV */}
         <View style={cardStyles.tile}>
           <View style={cardStyles.tileHeader}>
             <Text style={cardStyles.tileCategory}>💓 HRV (RMSSD)</Text>
-            <View style={[cardStyles.badge, { backgroundColor: 'rgba(139, 92, 246, 0.15)' }]}>
-              <Text style={[cardStyles.badgeText, { color: '#A78BFA' }]}>Vagal</Text>
+            <View style={[cardStyles.badge, { backgroundColor: isHrvValid ? 'rgba(139, 92, 246, 0.15)' : 'rgba(245, 158, 11, 0.15)' }]}>
+              <Text style={[cardStyles.badgeText, { color: isHrvValid ? '#A78BFA' : '#FBBF24' }]}>
+                {isHrvValid ? 'RMSSD' : (isHrvAcquiring ? 'Acquiring' : 'No Signal')}
+              </Text>
             </View>
           </View>
           <Text style={cardStyles.tileValue}>
-            {hasVitals ? hrv.toFixed(0) : '--'}{' '}
+            {isHrvValid ? hrv.toFixed(0) : (isHrvAcquiring ? '···' : '--')}{' '}
             <Text style={cardStyles.tileUnit}>ms</Text>
           </Text>
-          <Text style={cardStyles.tileSubtext}>Autonomic resilience</Text>
+          <Text style={cardStyles.tileSubtext}>
+            {isHrvValid ? 'Mobile PPG peak-interval DSP' : 'Filling PPG buffer (needs ~5s)'}
+          </Text>
         </View>
 
         {/* Tile 4: NOAA Heat Index */}
@@ -156,7 +193,7 @@ export default function SignalsCard({
           <View style={cardStyles.tileHeader}>
             <Text style={cardStyles.tileCategory}>🌡️ AMBIENT TEMP</Text>
             <View style={[cardStyles.badge, { backgroundColor: 'rgba(59, 130, 246, 0.15)' }]}>
-              <Text style={[cardStyles.badgeText, { color: '#60A5FA' }]}>BMP280</Text>
+              <Text style={[cardStyles.badgeText, { color: '#60A5FA' }]}>DHT11</Text>
             </View>
           </View>
           <Text style={cardStyles.tileValue}>
@@ -181,19 +218,25 @@ export default function SignalsCard({
           <Text style={cardStyles.tileSubtext}>Comfort zone: 30 - 60%</Text>
         </View>
 
-        {/* Tile 7: Barometric Pressure */}
+        {/* Tile 7: Vascular Age & Continuous Blood Pressure */}
         <View style={cardStyles.tile}>
           <View style={cardStyles.tileHeader}>
-            <Text style={cardStyles.tileCategory}>🧭 BAROMETRIC</Text>
-            <View style={[cardStyles.badge, { backgroundColor: 'rgba(16, 185, 129, 0.15)' }]}>
-              <Text style={[cardStyles.badgeText, { color: '#34D399' }]}>Sea-level</Text>
+            <Text style={cardStyles.tileCategory}>🫀 VASCULAR AGE</Text>
+            <View style={[cardStyles.badge, { backgroundColor: hasVascularData ? 'rgba(236, 72, 153, 0.15)' : 'rgba(245, 158, 11, 0.15)' }]}>
+              <Text style={[cardStyles.badgeText, { color: hasVascularData ? '#F472B6' : '#FBBF24' }]}>
+                {hasVascularData ? 'PPG DSP' : (isConnected ? 'Acquiring' : 'Offline')}
+              </Text>
             </View>
           </View>
           <Text style={cardStyles.tileValue}>
-            {pressHpa.toFixed(1)}{' '}
-            <Text style={cardStyles.tileUnit}>hPa</Text>
+            {hasVascularData ? vascularAge : (isConnected ? '···' : '--')}{' '}
+            <Text style={cardStyles.tileUnit}>yrs</Text>
           </Text>
-          <Text style={cardStyles.tileSubtext}>Ref: 1013.2 hPa (1 atm)</Text>
+          <Text style={cardStyles.tileSubtext}>
+            {hasVascularData
+              ? `cBP: ${cBP.sys}/${cBP.dia} mmHg | Stiff: ${stiffness.toFixed(2)}`
+              : 'Needs ~5s PPG for morphology'}
+          </Text>
         </View>
 
         {/* Tile 8: Motion Peak Acceleration */}

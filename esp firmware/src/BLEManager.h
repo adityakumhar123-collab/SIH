@@ -28,10 +28,11 @@ public:
     void sendStatusPacket(uint8_t batteryPct, uint8_t fwMajor, uint8_t fwMinor, uint32_t uptimeSec, uint8_t isBleConnected);
 
     // 0x03: Environment Packet (1 Hz)
-    void sendEnvironmentPacket(uint32_t timestampMs, float tempC, float pressureHpa, float humidityPct);
+    void sendEnvironmentPacket(uint32_t timestampMs, float tempC, float humidityPct, float heatIndexF);
 
     // 0x04: Vital Packet (100 Hz)
-    void sendVitalPacket(uint32_t timestampMs, uint32_t red, uint32_t ir, uint8_t signalQuality);
+    // Format: [0x04 | ts(4B) | red(4B) | ir(4B) | hr(2B int16) | spo2(1B int8) | xor(1B)] -> 18 Bytes
+    void sendVitalPacket(uint32_t timestampMs, uint32_t red, uint32_t ir, int16_t heartRate, int8_t spo2);
 
     // Legacy/Feature stream compatibility
     void sendFeaturePacket(uint8_t seq, uint8_t anomalyScore, uint8_t motionState, uint8_t dominantFreqHz, uint8_t zcr, uint8_t spectralEntropy, uint16_t eigenvalueRatioScaled, uint8_t wearConfidence, uint16_t peakResultantAccelMg, uint16_t durationUnits, const int8_t* motionEmbedding, uint8_t isThreat, const float* twelveFeatures);

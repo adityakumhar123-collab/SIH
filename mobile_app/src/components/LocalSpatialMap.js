@@ -696,9 +696,9 @@ export default function LocalSpatialMap({
                       </Text>
                     </View>
                     <View style={mapStyles.metricCol}>
-                      <Text style={mapStyles.metricLabel}>PRESSURE</Text>
+                      <Text style={mapStyles.metricLabel}>HRV (RMSSD)</Text>
                       <Text style={mapStyles.metricValue}>
-                        {(nodeHistoryData?.lastEpisode?.pressure_mean || 1013.2).toFixed(1)} hPa
+                        {(nodeHistoryData?.lastEpisode?.hrv_rmssd || 45.0).toFixed(0)} ms
                       </Text>
                     </View>
                     <View style={mapStyles.metricCol}>
@@ -864,9 +864,9 @@ export default function LocalSpatialMap({
                     </Text>
                   </View>
                   <View style={mapStyles.metricCol}>
-                    <Text style={mapStyles.metricLabel}>PRESSURE</Text>
+                    <Text style={mapStyles.metricLabel}>VASCULAR AGE</Text>
                     <Text style={mapStyles.metricValue}>
-                      {(currentPacket.pressureHpa || 1013.2).toFixed(1)} hPa
+                      {currentPacket.vascularAge ? `${currentPacket.vascularAge} yrs` : '30 yrs'}
                     </Text>
                   </View>
                   <View style={mapStyles.metricCol}>

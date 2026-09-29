@@ -7,7 +7,6 @@
 
 struct EnvironmentData {
     float temperature; // in °C
-    float pressure;    // in hPa (0.0f since BMP280 is removed)
     float humidity;    // in % RH
     float heatIndexF;  // in °F (calculated via Rothfusz regression)
     bool isAvailable;
@@ -20,8 +19,6 @@ public:
     bool begin();
     bool readSample(EnvironmentData& data);
 
-    // NOAA Rothfusz Heat Index regression
-    static float calculateHeatIndexF(float tempC, float humidityPct);
 
 private:
     EnvironmentSensor();

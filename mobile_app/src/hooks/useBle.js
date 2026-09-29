@@ -167,10 +167,15 @@ export default function useBle(activeTab, addLog) {
   const [currentPacket, setCurrentPacket] = useState({
     activityClass: 'standing',
     activityConfidence: 1.0,
-    hr: 72,
-    spo2: 98.0,
-    hrv: 45.0,
+    hr: 0,
+    spo2: 0,
+    hrv: 0,
+    arterialStiffness: 0,
+    vascularAge: 0,
+    pttMs: 0,
+    cBP: { sys: 0, dia: 0 },
     tempC: 24.0,
+    humidityPct: 50.0,
     heatIndexF: 75.0,
     heatIndexTier: 'NORMAL',
     diagnostic: null,
@@ -212,6 +217,9 @@ export default function useBle(activeTab, addLog) {
   // too many React re-renders from the 25Hz raw IMU stream.
   const lastGraphUpdateRef = useRef(0);
   const featureLogCounterRef = useRef(0);
+  const lastMotionLogRef = useRef(0);
+  const lastVitalLogRef = useRef(0);
+  const lastFeatureLogRef = useRef(0);
 
   // Keep activeTabRef in sync with the activeTab prop (updates on every tab switch)
   useEffect(() => {
@@ -274,7 +282,7 @@ export default function useBle(activeTab, addLog) {
   //    - Updates `batteryPct`, `uptime`, and logs firmware version.
   //
   // 3. TYPE 0x03 (ENVIRONMENT - 1 Hz):
-  //    - Pushes ambient temperature, pressure, humidity to EpisodeEngine.
+  //    - Pushes ambient temperature and humidity to EpisodeEngine.
   //
   // 4. TYPE 0x04 (VITALS / PPG - 100 Hz):
   //    - Pushes raw MAX30102 Red & IR photodiode counts to EpisodeEngine.
@@ -286,9 +294,15 @@ export default function useBle(activeTab, addLog) {
       // Feed raw IMU sample into the 200-sample sliding window buffer
       EpisodeEngine.pushMotionSample([parsed.ax, parsed.ay, parsed.az, parsed.gx, parsed.gy, parsed.gz]);
 
+      // Throttle terminal log to 0.5 Hz (every 2000ms)
+      const now = Date.now();
+      if (now - lastMotionLogRef.current > 2000) {
+        lastMotionLogRef.current = now;
+        addLog(`[MOTION PACKET] ts: ${parsed.timestampMs}ms | Accel: [${parsed.rawMg ? parsed.rawMg.join(', ') : `${parsed.ax}, ${parsed.ay}, ${parsed.az}`}] mg | Gyro: [${parsed.gx}, ${parsed.gy}, ${parsed.gz}] dps`, 'SENSOR');
+      }
+
       // Throttle graph waveform updates to 5 Hz (every 200ms) for UI smoothness
       if (isStreaming && activeTabRef.current === 'DASHBOARD') {
-        const now = Date.now();
         if (now - lastGraphUpdateRef.current > 200) {
           lastGraphUpdateRef.current = now;
           setStreamData((prevData) => {
@@ -318,9 +332,12 @@ export default function useBle(activeTab, addLog) {
             hr: windowResult.vitals.hr,
             spo2: windowResult.vitals.spo2,
             hrv: windowResult.vitals.hrv,
+            arterialStiffness: windowResult.vitals.arterialStiffness,
+            vascularAge: windowResult.vitals.vascularAge,
+            pttMs: windowResult.vitals.pttMs,
+            cBP: windowResult.vitals.cBP,
             tempC: EpisodeEngine.latestEnv.tempC,
             humidityPct: EpisodeEngine.latestEnv.humPct,
-            pressureHpa: EpisodeEngine.latestEnv.pressHpa,
             heatIndexF: windowResult.heatIndex.heatIndexF,
             heatIndexTier: windowResult.heatIndex.tier,
             diagnostic: windowResult.diagnostic,
@@ -329,6 +346,17 @@ export default function useBle(activeTab, addLog) {
             peakAccel: Math.round(windowResult.peakAccelMg),
             wearConfidence: 100
           }));
+
+          // Log processed features in the mobile app terminal (throttled every 2s)
+          const nowMs = Date.now();
+          if (nowMs - lastFeatureLogRef.current > 2000) {
+            lastFeatureLogRef.current = nowMs;
+            const bpStr = windowResult.vitals.cBP ? `${windowResult.vitals.cBP.sys}/${windowResult.vitals.cBP.dia}` : '120/80';
+            addLog(
+              `📊 [PROCESSED FEATURES] HR: ${windowResult.vitals.hr} bpm | SpO2: ${windowResult.vitals.spo2}% | HRV: ${windowResult.vitals.hrv}ms | Stiffness: ${windowResult.vitals.arterialStiffness} | V-Age: ${windowResult.vitals.vascularAge}y | cBP: ${bpStr} mmHg | Activity: ${windowResult.activityClass} (${(windowResult.activityConfidence * 100).toFixed(0)}%) | HeatIndex: ${windowResult.heatIndex.heatIndexF}°F (${windowResult.heatIndex.tier})`,
+              'FEATURE'
+            );
+          }
 
           // Log diagnostic hypothesis shifts to Diagnostics Terminal
           if (windowResult.diagnostic && windowResult.diagnostic.primary_hypothesis !== 'ANOMALY_UNCLEAR') {
@@ -342,22 +370,47 @@ export default function useBle(activeTab, addLog) {
         console.warn('[BLE] EpisodeEngine window processing failed:', err);
       }
     } else if (parsed.type === 'VITAL') {
-      // Ingest raw 100 Hz photodiode counts
-      EpisodeEngine.pushVitalSample(parsed.red, parsed.ir);
+      // Ingest raw 100 Hz photodiode counts + firmware Maxim algorithm vitals
+      EpisodeEngine.pushVitalSample(parsed.red, parsed.ir, parsed.heartRate, parsed.spo2);
+
+      // Throttled fallback: commit HR/SpO2 to currentPacket at most once every 2s
+      // (processWindow at 2 Hz already commits vitals into currentPacket smoothly)
+      const nowMs = Date.now();
+      if (nowMs - lastVitalLogRef.current > 2000) {
+        lastVitalLogRef.current = nowMs;
+        const hrStr  = parsed.heartRate !== -1 ? `${parsed.heartRate} bpm` : 'calculating';
+        const spo2Str = parsed.spo2 !== -1 ? `${parsed.spo2}%` : 'calculating';
+        addLog(`[VITAL PACKET] ts: ${parsed.timestampMs}ms | Red: ${parsed.red} | IR: ${parsed.ir} | HR: ${hrStr} | SpO2: ${spo2Str}`, 'SENSOR');
+
+        setCurrentPacket((prev) => {
+          if (prev.hr === parsed.heartRate && prev.spo2 === parsed.spo2) return prev;
+          return {
+            ...prev,
+            hr: parsed.heartRate,
+            spo2: parsed.spo2
+          };
+        });
+      }
     } else if (parsed.type === 'ENVIRONMENT') {
-      // Ingest ambient BMP280 atmospheric readings
-      EpisodeEngine.pushEnvironmentSample(parsed.tempC, parsed.pressureHpa, parsed.humidityPct);
-      setCurrentPacket((prev) => ({
-        ...prev,
-        tempC: parsed.tempC,
-        pressureHpa: parsed.pressureHpa,
-        humidityPct: parsed.humidityPct
-      }));
+      // Ingest ambient DHT11 atmospheric readings
+      EpisodeEngine.pushEnvironmentSample(parsed.tempC, parsed.humidityPct, parsed.heatIndexF);
+      setCurrentPacket((prev) => {
+        if (prev.tempC === parsed.tempC && prev.humidityPct === parsed.humidityPct && prev.heatIndexF === parsed.heatIndexF) {
+          return prev;
+        }
+        return {
+          ...prev,
+          tempC: parsed.tempC,
+          humidityPct: parsed.humidityPct,
+          heatIndexF: parsed.heatIndexF
+        };
+      });
+      addLog(`[ENV PACKET] ts: ${parsed.timestampMs}ms | Temp: ${parsed.tempC}°C | Humidity: ${parsed.humidityPct}% | Heat Index: ${parsed.heatIndexF}°F`, 'SENSOR');
     } else if (parsed.type === 'STATUS') {
       // Ingest periodic device health heartbeat
       if (parsed.batteryPct !== undefined) setBatteryPct(parsed.batteryPct);
       if (parsed.uptimeMinutes !== undefined) setUptime(parsed.uptimeMinutes);
-      addLog(`Status: Battery=${parsed.batteryPct}%, Uptime=${parsed.uptimeMinutes}m, FW=${parsed.fwVersion}`, 'SYSTEM');
+      addLog(`[STATUS PACKET] Battery: ${parsed.batteryPct}%, Uptime: ${parsed.uptimeMinutes}m, FW: ${parsed.fwVersion}, Connected: ${parsed.isBleConnected}`, 'SYSTEM');
     } else if (parsed.type === 'LEGACY_FEATURE') {
       // Compatibility fallback
       setCurrentPacket((prev) => ({
@@ -642,9 +695,9 @@ export default function useBle(activeTab, addLog) {
         setCurrentPacket({
           activityClass: 'standing',
           activityConfidence: 1.0,
-          hr: 72,
-          spo2: 98.0,
-          hrv: 45.0,
+          hr: 0,
+          spo2: 0,
+          hrv: 0,
           tempC: 24.0,
           heatIndexF: 75.0,
           heatIndexTier: 'NORMAL',
@@ -683,9 +736,9 @@ export default function useBle(activeTab, addLog) {
     setCurrentPacket({
       activityClass: 'standing',
       activityConfidence: 1.0,
-      hr: 72,
-      spo2: 98.0,
-      hrv: 45.0,
+      hr: 0,
+      spo2: 0,
+      hrv: 0,
       tempC: 24.0,
       heatIndexF: 75.0,
       heatIndexTier: 'NORMAL',
@@ -709,19 +762,44 @@ export default function useBle(activeTab, addLog) {
       return false;
     }
 
+    const base64Value = encodeSingleByteBase64(commandByte); // Encode to Base64
+
     try {
-      const base64Value = encodeSingleByteBase64(commandByte); // Encode to Base64
-      await activeDevice.writeCharacteristicWithResponseForService(
-        SERVICE_UUID,
-        CHAR_UUID_COMMAND,
-        base64Value
-      );
+      if (typeof activeDevice.writeCharacteristicWithResponseForService === 'function') {
+        await activeDevice.writeCharacteristicWithResponseForService(
+          SERVICE_UUID,
+          CHAR_UUID_COMMAND,
+          base64Value
+        );
+      } else {
+        await activeDevice.writeCharacteristicWithoutResponseForService(
+          SERVICE_UUID,
+          CHAR_UUID_COMMAND,
+          base64Value
+        );
+      }
       console.log(`[BLE] Sent command 0x${commandByte.toString(16).toUpperCase()}`);
       return true;
     } catch (err) {
-      console.error('[BLE] Command write error:', err);
-      setBleError(`Command error: ${err.message}`);
-      return false;
+      console.warn('[BLE] Primary command write failed, attempting write-without-response fallback:', err.message);
+      try {
+        if (typeof activeDevice.writeCharacteristicWithoutResponseForService === 'function') {
+          await activeDevice.writeCharacteristicWithoutResponseForService(
+            SERVICE_UUID,
+            CHAR_UUID_COMMAND,
+            base64Value
+          );
+          console.log(`[BLE] Sent command 0x${commandByte.toString(16).toUpperCase()} (via fallback)`);
+          return true;
+        }
+        throw err;
+      } catch (fallbackErr) {
+        console.error('[BLE] Command write error:', fallbackErr);
+        if (connectionState === 'CONNECTED') {
+          setBleError(`Command write failed: ${fallbackErr.message}`);
+        }
+        return false;
+      }
     }
   };
 

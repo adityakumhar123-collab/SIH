@@ -526,10 +526,10 @@ export default function App() {
     // Suppress threat evaluation if BLE is disconnected or unworn
     if (connectionState !== 'CONNECTED' || wearConfidence < 40) {
       highThreatStreakRef.current = 0;
-      setThreatScore(0.0);
-      setThreatScore3s(0.0);
-      setThreatScore3m(0.0);
-      setThreatScore5m(0.0);
+      setThreatScore((prev) => (prev === 0 ? prev : 0.0));
+      setThreatScore3s((prev) => (prev === 0 ? prev : 0.0));
+      setThreatScore3m((prev) => (prev === 0 ? prev : 0.0));
+      setThreatScore5m((prev) => (prev === 0 ? prev : 0.0));
       return;
     }
 
@@ -543,10 +543,10 @@ export default function App() {
     });
 
     let finalScore = score;
-    setThreatScore(finalScore);
-    setThreatScore3s(score3s);
-    setThreatScore3m(score3m);
-    setThreatScore5m(score5m);
+    setThreatScore((prev) => (Math.abs(prev - finalScore) < 0.005 ? prev : finalScore));
+    setThreatScore3s((prev) => (Math.abs(prev - score3s) < 0.005 ? prev : score3s));
+    setThreatScore3m((prev) => (Math.abs(prev - score3m) < 0.005 ? prev : score3m));
+    setThreatScore5m((prev) => (Math.abs(prev - score5m) < 0.005 ? prev : score5m));
 
     // Logging throttle: only print to logs if score changed by at least 2%
     const scoreDelta = Math.abs(finalScore - lastLoggedScoreRef.current);

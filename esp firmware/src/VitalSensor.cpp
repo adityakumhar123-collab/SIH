@@ -118,40 +118,29 @@ bool VitalSensor::readSample(VitalData& data) {
         irBuffer[PPG_BUFFER_LENGTH - 1] = latestIr;
     }
 
-    // Finger detected if IR count >= 20000
+    // Finger detection is informational only — does NOT gate the algorithm (per packet_design.md §3.2)
     bool finger = (latestIr >= 20000);
 
-    if (finger) {
-        // Run Maxim SpO2 & Heart Rate algorithm every 2 seconds when finger is present
-        if (now - lastCalcTimeMs >= 2000) {
-            lastCalcTimeMs = now;
-            maxim_heart_rate_and_oxygen_saturation(
-                irBuffer, PPG_BUFFER_LENGTH, redBuffer,
-                &spo2, &validSPO2, &heartRate, &validHeartRate
-            );
-
-            if (validHeartRate == 1 && heartRate >= 40 && heartRate <= 200) {
-                lastValidHr = (float)heartRate;
-            }
-            if (validSPO2 == 1 && spo2 >= 70 && spo2 <= 100) {
-                lastValidSpo2 = (float)spo2;
-            }
-        }
-
-        data.fingerDetected = true;
-        data.red = latestRed;
-        data.ir = latestIr;
-        data.heartRate = lastValidHr;
-        data.spo2 = lastValidSpo2;
-        data.signalQuality = (validHeartRate == 1 || validSPO2 == 1) ? 95 : 75;
-    } else {
-        data.fingerDetected = false;
-        data.red = latestRed;
-        data.ir = latestIr;
-        data.heartRate = 0.0f;
-        data.spo2 = 0.0f;
-        data.signalQuality = 0;
+    // Run Maxim built-in algorithm unconditionally every 2 seconds
+    // Algorithm self-signals invalid via validHeartRate/validSPO2 = 0 → we pass -1 to mobile
+    if (now - lastCalcTimeMs >= 2000) {
+        lastCalcTimeMs = now;
+        maxim_heart_rate_and_oxygen_saturation(
+            irBuffer, PPG_BUFFER_LENGTH, redBuffer,
+            &spo2, &validSPO2, &heartRate, &validHeartRate
+        );
+        Serial.printf("[VitalSensor] Maxim: HR=%d (valid=%d) | SpO2=%d (valid=%d) | Finger=%s | IR=%lu\n",
+                      heartRate, validHeartRate, spo2, validSPO2,
+                      finger ? "YES" : "NO", latestIr);
     }
+
+    // Pass raw Maxim output always — -1 = algorithm is still accumulating / no valid reading
+    data.fingerDetected = finger;
+    data.red            = latestRed;
+    data.ir             = latestIr;
+    data.heartRate      = (validHeartRate == 1) ? (float)heartRate : -1.0f;
+    data.spo2           = (validSPO2     == 1) ? (float)spo2      : -1.0f;
+    data.signalQuality  = (validHeartRate == 1 || validSPO2 == 1) ? 95 : (finger ? 50 : 0);
 
     return true;
 }

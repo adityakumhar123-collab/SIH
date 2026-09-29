@@ -1,5 +1,5 @@
 // =============================================================================
-// DashboardTab.js — RakshaBand Live Telemetry, Activity & Diagnostic Reasoning UI
+// DashboardTab.js — RakshaBand Live Telemetry, Activity & Inference Engine UI
 // =============================================================================
 //
 // DATA FLOW & ARCHITECTURE TRACE:
@@ -340,13 +340,13 @@ const DashboardTab = React.memo(({
         </View>
       </View>
 
-      {/* ─── 6. Diagnostic Reasoning & Threat Assessment ───────────── */}
+      {/* ─── 6. Inference Engine & Threat Assessment ───────────────── */}
       {/* TRACE: ContextEngine.js fuses DiagnosticReasoningEngine output with GPS familiarity. */}
       {/* If is_direct_escalation: threatScore = 0.95 (CRITICAL). */}
       {/* If normal: threatScore = baseScore * (1.2 - 0.4 * familiarityScore). */}
       {/* Threat Level: NORMAL (<40%), ADVISORY (40-71%), CRITICAL (>=72% -> triggers alert). */}
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>🧠 Diagnostic Reasoning Engine</Text>
+        <Text style={styles.cardTitle}>🧠 Inference Engine</Text>
 
         {/* Threat Score Circular Gauge */}
         <View style={styles.gaugeContainer}>

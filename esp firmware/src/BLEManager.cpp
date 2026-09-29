@@ -123,8 +123,8 @@ void BLEManager::begin() {
     pAdvertising->setScanResponseData(oScanResponseData);
     pAdvertising->setScanResponse(true);
 
-    pAdvertising->setMinPreferred(0x06);
-    pAdvertising->setMinPreferred(0x12);
+    pAdvertising->setMinPreferred(0x10); // 20.0 ms (stable wearable connection interval)
+    pAdvertising->setMaxPreferred(0x20); // 40.0 ms
 
     BLEDevice::startAdvertising();
     Serial.println("[BLE] Service started. Advertising active.");
@@ -136,6 +136,7 @@ void BLEManager::setDeviceInfo(const char* info) {
     }
 }
 
+// 0x01: Motion Packet (100 Hz)
 // 0x01: Motion Packet (100 Hz)
 // Format: [0x01 (1B) | timestamp ms (4B) | ax (2B) | ay (2B) | az (2B) | gx (2B) | gy (2B) | gz (2B) | checksum (1B)] -> 18 Bytes
 void BLEManager::sendMotionPacket(uint32_t timestampMs, const IMUData& imu) {
@@ -178,6 +179,14 @@ void BLEManager::sendMotionPacket(uint32_t timestampMs, const IMUData& imu) {
 
     pCharSensor->setValue(packet, 18);
     pCharSensor->notify();
+
+    // Serial monitor debug output (throttled to 1 Hz)
+    static uint32_t lastMotionDebugMs = 0;
+    if (timestampMs - lastMotionDebugMs >= 1000) {
+        lastMotionDebugMs = timestampMs;
+        Serial.printf("[BLE TX][0x01 MOTION] ts: %lu, ax: %d mg, ay: %d mg, az: %d mg, gx: %d, gy: %d, gz: %d | chk: 0x%02X\n",
+                      timestampMs, axMg, ayMg, azMg, gxUnits, gyUnits, gzUnits, packet[17]);
+    }
 }
 
 // 0x02: Device Status Packet (transmitted on 1% battery drop or periodic 5min)
@@ -201,11 +210,15 @@ void BLEManager::sendStatusPacket(uint8_t batteryPct, uint8_t fwMajor, uint8_t f
 
     pCharStatus->setValue(packet, 10);
     pCharStatus->notify();
+
+    // Serial monitor debug output
+    Serial.printf("[BLE TX][0x02 STATUS] battery: %d%%, fw: v%d.%d, uptime: %lus, conn: %d | chk: 0x%02X\n",
+                  batteryPct, fwMajor, fwMinor, uptimeSec, isBleConnected, packet[9]);
 }
 
 // 0x03: Environment Packet (1 Hz)
-// Format: [0x03 (1B) | Timestamp ms (4B) | Temp (4B float) | Pressure (4B float) | Humidity (4B float) | checksum (1B)] -> 18 Bytes
-void BLEManager::sendEnvironmentPacket(uint32_t timestampMs, float tempC, float pressureHpa, float humidityPct) {
+// Format: [0x03 (1B) | Timestamp ms (4B) | Temp (4B float) | Humidity (4B float) | HeatIndex (4B float) | checksum (1B)] -> 18 Bytes
+void BLEManager::sendEnvironmentPacket(uint32_t timestampMs, float tempC, float humidityPct, float heatIndexF) {
     if (!deviceConnected || pCharFeature == nullptr) return;
 
     uint8_t packet[18];
@@ -217,21 +230,27 @@ void BLEManager::sendEnvironmentPacket(uint32_t timestampMs, float tempC, float 
     packet[4] = (uint8_t)((timestampMs >> 24) & 0xFF);
 
     memcpy(&packet[5], &tempC, 4);
-    memcpy(&packet[9], &pressureHpa, 4);
-    memcpy(&packet[13], &humidityPct, 4);
+    memcpy(&packet[9], &humidityPct, 4);
+    memcpy(&packet[13], &heatIndexF, 4);
 
     packet[17] = calculateChecksum(packet, 17);
 
     pCharFeature->setValue(packet, 18);
     pCharFeature->notify();
+
+    // Serial monitor debug output
+    Serial.printf("[BLE TX][0x03 ENV] ts: %lu, temp: %.1f°C, hum: %.1f%%, heatIndex: %.1f°F | chk: 0x%02X\n",
+                  timestampMs, tempC, humidityPct, heatIndexF, packet[17]);
 }
 
 // 0x04: Vital Packet (100 Hz)
-// Format: [0x04 (1B) | Timestamp ms (4B) | RedChannel (4B) | IRChannel (4B) | SignalQuality (1B) | checksum (1B)] -> 15 Bytes
-void BLEManager::sendVitalPacket(uint32_t timestampMs, uint32_t red, uint32_t ir, uint8_t signalQuality) {
+// Format: [0x04 (1B) | Timestamp ms (4B) | RedChannel (4B) | IRChannel (4B) | HeartRate (2B int16) | SpO2 (1B int8) | checksum (1B)] -> 18 Bytes
+// heartRate: BPM * 1 (use -1 if not yet calculated/invalid)
+// spo2:      % value 0-100 (use -1 if not yet calculated/invalid)
+void BLEManager::sendVitalPacket(uint32_t timestampMs, uint32_t red, uint32_t ir, int16_t heartRate, int8_t spo2) {
     if (!deviceConnected || !isStreaming || pCharFeature == nullptr) return;
 
-    uint8_t packet[15];
+    uint8_t packet[18];
     packet[0] = PACKET_TYPE_VITAL; // 0x04
 
     packet[1] = (uint8_t)(timestampMs & 0xFF);
@@ -242,11 +261,26 @@ void BLEManager::sendVitalPacket(uint32_t timestampMs, uint32_t red, uint32_t ir
     memcpy(&packet[5], &red, 4);
     memcpy(&packet[9], &ir, 4);
 
-    packet[13] = signalQuality;
-    packet[14] = calculateChecksum(packet, 14);
+    // Heart Rate: int16_t little-endian (BPM, -1 = calculating)
+    packet[13] = (uint8_t)(heartRate & 0xFF);
+    packet[14] = (uint8_t)((heartRate >> 8) & 0xFF);
 
-    pCharFeature->setValue(packet, 15);
+    // SpO2: int8_t (-1 = calculating)
+    packet[15] = (uint8_t)(spo2);
+
+    packet[16] = 0x00; // reserved for future use (maintains 4-byte alignment)
+    packet[17] = calculateChecksum(packet, 17);
+
+    pCharFeature->setValue(packet, 18);
     pCharFeature->notify();
+
+    // Serial monitor debug output (throttled to 1 Hz)
+    static uint32_t lastVitalDebugMs = 0;
+    if (timestampMs - lastVitalDebugMs >= 1000) {
+        lastVitalDebugMs = timestampMs;
+        Serial.printf("[BLE TX][0x04 VITAL] ts: %lu, red: %lu, ir: %lu, hr: %d bpm, spo2: %d%% | chk: 0x%02X\n",
+                      timestampMs, red, ir, heartRate, spo2, packet[17]);
+    }
 }
 
 void BLEManager::sendFeaturePacket(uint8_t seq, uint8_t anomalyScore, uint8_t motionState, uint8_t dominantFreqHz, uint8_t zcr, uint8_t spectralEntropy, uint16_t eigenvalueRatioScaled, uint8_t wearConfidence, uint16_t peakResultantAccelMg, uint16_t durationUnits, const int8_t* motionEmbedding, uint8_t isThreat, const float* twelveFeatures) {

@@ -158,34 +158,39 @@ void SamplerTask(void* pvParameters) {
 
     IMUData imuSample;
     VitalData vitalSample;
+    uint32_t tickCounter = 0;
 
     Serial.println("[Task] 100 Hz Sampler task active.");
 
     while (1) {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
         uint32_t nowMs = millis();
+        tickCounter++;
 
-        // 1. Read IMU
+        // 1. Read IMU at 100 Hz
         bool imuOk = IMUSensor::getInstance().readSample(imuSample);
         if (imuOk) {
             g_latestImu = imuSample;
             EdgeAnalytics::getInstance().processIMUSample(imuSample);
-
-            // Mode 1 (BLE ON): Transmit 0x01 Motion Packet @ 100 Hz
-            if (BLEManager::getInstance().isConnected()) {
-                BLEManager::getInstance().sendMotionPacket(nowMs, imuSample);
-            }
         }
 
-        // 2. Read Vitals (MAX30102)
+        // 2. Read Vitals (MAX30102) at 100 Hz
         bool vitalOk = VitalSensor::getInstance().readSample(vitalSample);
         if (vitalOk) {
             g_latestVital = vitalSample;
             EdgeAnalytics::getInstance().processVitalSample(vitalSample);
+        }
 
-            // Mode 1 (BLE ON): Transmit 0x04 Vital Packet @ 100 Hz
-            if (BLEManager::getInstance().isConnected()) {
-                BLEManager::getInstance().sendVitalPacket(nowMs, vitalSample.red, vitalSample.ir, vitalSample.signalQuality);
+        // Mode 1 (BLE ON): Transmit packets over BLE
+        // Stagger BLE notifications across alternating 10ms ticks (Motion on even ticks, Vitals on odd ticks)
+        // to prevent BLE stack GATT buffer congestion while preserving 100 Hz hardware sampling.
+        if (BLEManager::getInstance().isConnected()) {
+            if (imuOk && (tickCounter % 2 == 0)) {
+                BLEManager::getInstance().sendMotionPacket(nowMs, imuSample);
+            } else if (vitalOk) {
+                int16_t hrToSend   = (int16_t)vitalSample.heartRate; // already -1 when invalid
+                int8_t  spo2ToSend = (int8_t)vitalSample.spo2;       // already -1 when invalid
+                BLEManager::getInstance().sendVitalPacket(nowMs, vitalSample.red, vitalSample.ir, hrToSend, spo2ToSend);
             }
         }
     }
@@ -217,8 +222,8 @@ void EnvironmentTask(void* pvParameters) {
             BLEManager::getInstance().sendEnvironmentPacket(
                 nowMs,
                 envSample.temperature,
-                envSample.pressure,
-                envSample.humidity
+                envSample.humidity,
+                envSample.heatIndexF
             );
         }
 
@@ -258,7 +263,7 @@ void EnvironmentTask(void* pvParameters) {
                           actStr, g_latestImu.ax, g_latestImu.ay, g_latestImu.az, g_latestImu.gx, g_latestImu.gy, g_latestImu.gz);
             Serial.printf("[VITALS] Finger: %-3s | HR: %5.1f bpm | SpO2: %5.1f%% | SignalQuality: %3d%%\n",
                           g_latestVital.fingerDetected ? "YES" : "NO", g_latestVital.heartRate, g_latestVital.spo2, g_latestVital.signalQuality);
-            Serial.printf("[ENV]    Temp: %5.1f°C | Press: N/A (DHT11) | Humid: %4.1f%% | HeatIndex: %5.1f°F (%s)\n",
+            Serial.printf("[ENV]    Temp: %5.1f°C | Humid: %4.1f%% | HeatIndex: %5.1f°F (%s)\n",
                           envSample.temperature, envSample.humidity, envSample.heatIndexF,
                           envSample.heatIndexF >= HEAT_INDEX_DANGER ? "DANGER" :
                           envSample.heatIndexF >= HEAT_INDEX_EXTREME_CAUTION ? "EXTREME CAUTION" :

@@ -61,7 +61,7 @@ class DiagnosticReasoningEngineClass {
   evaluate(context) {
     const {
       physEval = { zScores: { hr: 0, spo2: 0 }, distance: 0 },
-      envEval = { zScores: { temperature: 0, humidity: 0, pressure: 0 }, distance: 0 },
+      envEval = { zScores: { temperature: 0, humidity: 0 }, distance: 0 },
       heatIndex = { heatIndexF: 75, tier: 'NORMAL', riskLevel: 0 },
       activityClass = 'standing',
       peakAccelMg = 1000,

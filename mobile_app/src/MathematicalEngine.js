@@ -118,12 +118,11 @@ export const COLD_START_BASELINES = {
   environment: {
     domain: 'environment',
     sub_key: 'global',
-    dimension_names: ['temperature', 'humidity', 'pressure'],
-    mean_vector: [24.0, 50.0, 1013.25],
+    dimension_names: ['temperature', 'humidity'],
+    mean_vector: [24.0, 50.0],
     covariance_matrix: [
-      [16.0,  0.0,   0.0],  // std(Temp) = 4.0 °C
-      [0.0, 100.0,   0.0],  // std(RH) = 10.0 %
-      [0.0,   0.0,  25.0]   // std(Press) = 5.0 hPa
+      [16.0,   0.0],  // std(Temp) = 4.0 °C
+      [ 0.0, 100.0]   // std(RH) = 10.0 %
     ],
     sample_count: 50,
     purity_gate_threshold: 3.0,

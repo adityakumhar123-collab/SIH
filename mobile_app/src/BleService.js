@@ -8,9 +8,11 @@
 // 2. Status Packet (Type 0x02, 10 Bytes, heartbeat):
 //    [0x02 | battery(1B) | fwMajor(1B) | fwMinor(1B) | uptime(4B) | isConn(1B) | xor(1B)]
 // 3. Environment Packet (Type 0x03, 18 Bytes, 1 Hz):
-//    [0x03 | ts(4B) | temp(4B float) | press(4B float) | hum(4B float) | xor(1B)]
-// 4. Vital Packet (Type 0x04, 15 Bytes, 100 Hz):
-//    [0x04 | ts(4B) | red(4B) | ir(4B) | signalQuality(1B) | xor(1B)]
+//    [0x03 | ts(4B) | temp(4B float) | humidity(4B float) | heatIndex(4B float) | xor(1B)]
+// 4. Vital Packet (Type 0x04, 18 Bytes, 100 Hz):
+//    [0x04 | ts(4B) | red(4B) | ir(4B) | hr(2B int16) | spo2(1B int8) | rsvd(1B) | xor(1B)]
+//    hr:   BPM as int16 (-1 = calculating/no finger)
+//    spo2: % as int8   (-1 = calculating/no finger)
 // =============================================================================
 
 export const SERVICE_UUID          = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
@@ -105,26 +107,28 @@ export function encodeSingleByteBase64(byte) {
 //   [0]      uint8_t   Packet Type (0x03)
 //   [1..4]   uint32_t  Timestamp (ms)
 //   [5..8]   float32   Ambient Temperature (°C)
-//   [9..12]  float32   Atmospheric Pressure (hPa)
-//   [13..16] float32   Relative Humidity (%)
+//   [9..12]  float32   Relative Humidity (%)
+//   [13..16] float32   Calculated Heat Index (°F)
 //   [17]     uint8_t   XOR Checksum
 //
-// Type 0x04: VITALS / PPG PACKET (15 Bytes) — Transmitted at 100 Hz
+// Type 0x04: VITALS / PPG PACKET (18 Bytes) — Transmitted at 100 Hz
 //   [0]      uint8_t   Packet Type (0x04)
 //   [1..4]   uint32_t  Timestamp (ms)
 //   [5..8]   uint32_t  MAX30102 Red LED ADC Count (raw photodiode level)
 //   [9..12]  uint32_t  MAX30102 IR LED ADC Count (raw photodiode level)
-//   [13]     uint8_t   Optical Signal Quality Index (0 - 100)
-//   [14]     uint8_t   XOR Checksum
+//   [13..14] int16_t   Heart Rate in BPM (-1 = calculating / no finger)
+//   [15]     int8_t    SpO2 in % (-1 = calculating / no finger)
+//   [16]     uint8_t   Reserved (0x00)
+//   [17]     uint8_t   XOR Checksum
 // =============================================================================
 
 // Helper for little-endian 32-bit unsigned integer decoding
 function readUint32LE(bytes, offset) {
   return (
-    (bytes[offset]) |
+    ((bytes[offset]) |
     (bytes[offset + 1] << 8) |
     (bytes[offset + 2] << 16) |
-    ((bytes[offset + 3] << 24) >>> 0)
+    (bytes[offset + 3] << 24)) >>> 0
   );
 }
 
@@ -156,7 +160,7 @@ export function parseIncomingPacket(bytes) {
   else if (type === 0x02) expectedLen = 10;  // Status
   else if (type === 0x03) expectedLen = 18;  // Environment
   else if (type === 0x04) {
-    if (bytes.length === 15) expectedLen = 15;      // Vital
+    if (bytes.length === 18) expectedLen = 18;      // Vital (current)
     else if (bytes.length >= 46) expectedLen = 46;  // Legacy feature
   }
 
@@ -184,7 +188,7 @@ export function parseIncomingPacket(bytes) {
     case 0x03:
       return parseEnvironmentPacket(bytes);
     case 0x04:
-      return bytes.length === 15 ? parseVitalPacket(bytes) : parseLegacyFeaturePacket(bytes);
+      return bytes.length === 18 ? parseVitalPacket(bytes) : parseLegacyFeaturePacket(bytes);
     default:
       return null;
   }
@@ -252,39 +256,53 @@ function parseStatusPacket(bytes) {
 
 /**
  * Parses Type 0x03 Environment Packet (18 Bytes)
- * Decodes ambient temperature (°C), atmospheric pressure (hPa), and relative humidity (%).
+ * Decodes ambient temperature (°C), relative humidity (%), and calculated heat index (°F).
  */
 function parseEnvironmentPacket(bytes) {
   const timestampMs = readUint32LE(bytes, 1);
   const tempC = readFloat32LE(bytes, 5);
-  const pressureHpa = readFloat32LE(bytes, 9);
-  const humidityPct = readFloat32LE(bytes, 13);
+  const humidityPct = readFloat32LE(bytes, 9);
+  const heatIndexF = readFloat32LE(bytes, 13);
 
   return {
     type: 'ENVIRONMENT',
     timestampMs,
     tempC: Number(tempC.toFixed(2)),
-    pressureHpa: Number(pressureHpa.toFixed(1)),
-    humidityPct: Number(humidityPct.toFixed(1))
+    humidityPct: Number(humidityPct.toFixed(1)),
+    heatIndexF: Number(heatIndexF.toFixed(1))
   };
 }
 
+// Helper for signed 8-bit integer decoding (int8)
+function readInt8(bytes, offset) {
+  const val = bytes[offset];
+  return val > 127 ? val - 256 : val;
+}
+
 /**
- * Parses Type 0x04 Vitals / Photoplethysmography Packet (15 Bytes)
- * Decodes raw Red and Infrared photodiode ADC counts for heart rate and SpO2 calculation.
+ * Parses Type 0x04 Vitals / Photoplethysmography Packet (18 Bytes)
+ * Decodes raw Red and IR photodiode ADC counts, plus firmware-computed
+ * heart rate (BPM) and SpO2 (%) from the Maxim algorithm.
+ *
+ * heartRate: -1 means the Maxim algorithm is still calculating or no finger detected.
+ * spo2:      -1 means the same. These are informational; the mobile app computes
+ *             its own refined HR/SpO2 via processPpgWaveform() on the raw channels.
  */
 function parseVitalPacket(bytes) {
   const timestampMs = readUint32LE(bytes, 1);
   const red = readUint32LE(bytes, 5);
   const ir = readUint32LE(bytes, 9);
-  const signalQuality = bytes[13];
+  const heartRate = readInt16LE(bytes, 13); // BPM, -1 = calculating
+  const spo2 = readInt8(bytes, 15);         // %, -1 = calculating
+  // bytes[16] = reserved
 
   return {
     type: 'VITAL',
     timestampMs,
     red,
     ir,
-    signalQuality
+    heartRate,
+    spo2
   };
 }
 
